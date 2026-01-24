@@ -36,9 +36,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
 
@@ -48,6 +51,85 @@ import spacy
 # ============================================================================
 # CORE EXTRACTION LOGIC (shared by CLI and GUI)
 # ============================================================================
+
+def compute_file_md5(path: Path) -> str:
+    """Compute MD5 checksum of a file."""
+    md5 = hashlib.md5()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def save_run_metadata(
+    output_path: Path,
+    input_paths: List[Path],
+    input_checksums: Dict[str, str],
+    output_checksum: str,
+    args: Dict[str, any],
+    stats: Dict[str, any],
+) -> None:
+    """Save extraction metadata to JSON file alongside output."""
+    json_path = output_path.with_suffix(".json")
+    
+    metadata = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "output_file": str(output_path),
+        "output_checksum": output_checksum,
+        "input_files": [str(p) for p in input_paths],
+        "input_checksums": input_checksums,
+        "settings": {
+            "model": args.get("model", "en_core_web_sm"),
+            "encoding": args.get("encoding", "utf-8"),
+            "include_aux": args.get("include_aux", False),
+            "chunk_size": args.get("chunk_size", 2_000_000),
+            "overlap": args.get("overlap", 5_000),
+            "dedupe_window": args.get("dedupe_window", 50_000),
+            "heartbeat_chunks": args.get("heartbeat_chunks", 10),
+            "output_format": "tsv" if args.get("tsv", False) else "csv",
+        },
+        "statistics": stats,
+    }
+    
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def load_run_metadata(json_path: Path) -> Dict:
+    """Load extraction metadata from JSON file."""
+    with json_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def verify_input_file_checksums(input_paths: List[Path], metadata: Dict) -> Dict[str, str]:
+    """
+    Verify input file checksums against metadata.
+    
+    Returns dict with issues found:
+    {
+        "missing_files": [list of paths that don't exist],
+        "checksum_mismatches": [list of paths with different checksums],
+    }
+    """
+    input_checksums = metadata.get("input_checksums", {})
+    issues = {"missing_files": [], "checksum_mismatches": []}
+    
+    for file_path in input_paths:
+        file_path_str = str(file_path)
+        
+        # Check if this file is in the metadata
+        if file_path_str in input_checksums:
+            expected_checksum = input_checksums[file_path_str]
+            
+            if not file_path.exists():
+                issues["missing_files"].append(file_path_str)
+            else:
+                actual_checksum = compute_file_md5(file_path)
+                if actual_checksum != expected_checksum:
+                    issues["checksum_mismatches"].append(file_path_str)
+    
+    return issues
+
 
 def stream_char_chunks(
     path: Path,
@@ -136,22 +218,23 @@ def run_cli() -> None:
     ap.add_argument("paths", nargs="*", help="Paths to text files.")
     ap.add_argument("--paths-file", help="Text file with one path per line (# comments allowed).")
     ap.add_argument("-o", "--output", default="verbs.csv", help="Output file path (default: verbs.csv).")
+    ap.add_argument("--load-metadata", help="Load settings from a previous run JSON file (CLI args override loaded settings).")
     ap.add_argument("--tsv", action="store_true", help="Write TSV instead of CSV.")
-    ap.add_argument("--model", default="en_core_web_sm", help="spaCy model name (default: en_core_web_sm).")
-    ap.add_argument("--encoding", default="utf-8", help="Input file encoding (default: utf-8).")
+    ap.add_argument("--model", default=None, help="spaCy model name (default: en_core_web_sm).")
+    ap.add_argument("--encoding", default=None, help="Input file encoding (default: utf-8).")
     ap.add_argument("--include-aux", action="store_true", help="Also treat AUX tokens as verbs.")
-    ap.add_argument("--chunk-size", type=int, default=2_000_000, help="Chunk size in characters (default: 2,000,000).")
-    ap.add_argument("--overlap", type=int, default=5_000, help="Chunk overlap in characters (default: 5,000).")
+    ap.add_argument("--chunk-size", type=int, default=None, help="Chunk size in characters (default: 2,000,000).")
+    ap.add_argument("--overlap", type=int, default=None, help="Chunk overlap in characters (default: 5,000).")
     ap.add_argument(
         "--dedupe-window",
         type=int,
-        default=50_000,
+        default=None,
         help="How many recent sentences to remember for de-duplication (default: 50,000).",
     )
     ap.add_argument(
         "--heartbeat-chunks",
         type=int,
-        default=10,
+        default=None,
         help="Log a progress heartbeat every N chunks (default: 10).",
     )
     ap.add_argument(
@@ -162,11 +245,61 @@ def run_cli() -> None:
     )
     args = ap.parse_args()
 
+    # Load metadata if provided
+    if args.load_metadata:
+        metadata_path = Path(args.load_metadata)
+        if not metadata_path.exists():
+            raise SystemExit(f"Metadata file not found: {metadata_path}")
+        
+        metadata = load_run_metadata(metadata_path)
+        settings = metadata.get("settings", {})
+        
+        # Use loaded settings as defaults, but CLI args override
+        args.model = args.model or settings.get("model", "en_core_web_sm")
+        args.encoding = args.encoding or settings.get("encoding", "utf-8")
+        args.chunk_size = args.chunk_size or settings.get("chunk_size", 2_000_000)
+        args.overlap = args.overlap or settings.get("overlap", 5_000)
+        args.dedupe_window = args.dedupe_window or settings.get("dedupe_window", 50_000)
+        args.heartbeat_chunks = args.heartbeat_chunks or settings.get("heartbeat_chunks", 10)
+        
+        if not args.include_aux:
+            args.include_aux = settings.get("include_aux", False)
+        if not args.tsv:
+            args.tsv = (settings.get("output_format", "csv") == "tsv")
+    else:
+        # Use defaults if not loading metadata
+        args.model = args.model or "en_core_web_sm"
+        args.encoding = args.encoding or "utf-8"
+        args.chunk_size = args.chunk_size or 2_000_000
+        args.overlap = args.overlap or 5_000
+        args.dedupe_window = args.dedupe_window or 50_000
+        args.heartbeat_chunks = args.heartbeat_chunks or 10
+
     logger = setup_logging(args.log_level)
 
     paths = iter_paths(args.paths, args.paths_file)
     if not paths:
         raise SystemExit("No input paths provided.")
+    
+    # Verify input file checksums if metadata was loaded
+    if args.load_metadata:
+        logger.info("Verifying input file checksums against metadata...")
+        issues = verify_input_file_checksums(paths, metadata)
+        
+        if issues["missing_files"]:
+            logger.warning("⚠ Missing input files:")
+            for f in issues["missing_files"]:
+                logger.warning(f"   {f}")
+        
+        if issues["checksum_mismatches"]:
+            logger.warning("⚠ Input files have changed (checksum mismatch):")
+            for f in issues["checksum_mismatches"]:
+                logger.warning(f"   {f}")
+        
+        if issues["missing_files"] or issues["checksum_mismatches"]:
+            logger.warning("⚠ Proceeding with extraction despite file changes")
+        else:
+            logger.info("✓ All input files verified (checksum OK)")
 
     # Load spaCy with only what we need.
     t0 = time.time()
@@ -311,7 +444,33 @@ def run_cli() -> None:
             f"{elapsed_all:,.1f}s total"
         )
 
+    # Compute checksums and save metadata
+    logger.info("Computing file checksums...")
+    input_checksums = {str(p): compute_file_md5(p) for p in paths if p.exists()}
+    output_checksum = compute_file_md5(out_path)
+    
+    metadata_args = {
+        "model": args.model,
+        "encoding": args.encoding,
+        "include_aux": args.include_aux,
+        "chunk_size": args.chunk_size,
+        "overlap": args.overlap,
+        "dedupe_window": args.dedupe_window,
+        "heartbeat_chunks": args.heartbeat_chunks,
+        "tsv": args.tsv,
+    }
+    
+    stats = {
+        "total_documents": overall_docs,
+        "total_chunks": overall_chunks,
+        "total_sentences": overall_sents,
+        "total_verbs": overall_verbs,
+        "elapsed_seconds": elapsed_all,
+    }
+    
+    save_run_metadata(out_path, paths, input_checksums, output_checksum, metadata_args, stats)
     logger.info(f"Wrote output: {out_path}")
+    logger.info(f"Wrote metadata: {out_path.with_suffix('.json')}")
 
 
 # ============================================================================
@@ -526,6 +685,31 @@ def run_gui() -> None:
                 self.progress_update.emit(
                     f"✓ Run complete | {overall_chunks:,} chunks | {overall_sents:,} sentences | {overall_verbs:,} verbs"
                 )
+                
+                # Save metadata
+                input_checksums = {str(p): compute_file_md5(p) for p in self.paths if p.exists()}
+                output_checksum = compute_file_md5(self.output_path)
+                
+                metadata_args = {
+                    "model": self.model,
+                    "encoding": self.encoding,
+                    "include_aux": self.include_aux,
+                    "chunk_size": self.chunk_size,
+                    "overlap": self.overlap,
+                    "dedupe_window": self.dedupe_window,
+                    "heartbeat_chunks": self.heartbeat_chunks,
+                    "tsv": self.use_tsv,
+                }
+                
+                stats = {
+                    "total_chunks": overall_chunks,
+                    "total_sentences": overall_sents,
+                    "total_verbs": overall_verbs,
+                }
+                
+                save_run_metadata(self.output_path, self.paths, input_checksums, output_checksum, metadata_args, stats)
+                self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")
+                
                 self.finished.emit(True, f"Extraction complete. Output: {self.output_path}")
                 
             except Exception as e:
@@ -579,6 +763,14 @@ def run_gui() -> None:
             # Settings section
             settings_group = QGroupBox("Settings")
             settings_layout = QVBoxLayout()
+            
+            # Load metadata button
+            load_metadata_layout = QHBoxLayout()
+            self.load_metadata_btn = QPushButton("Load Settings from JSON")
+            self.load_metadata_btn.clicked.connect(self.load_metadata_dialog)
+            load_metadata_layout.addWidget(self.load_metadata_btn)
+            load_metadata_layout.addStretch()
+            settings_layout.addLayout(load_metadata_layout)
             
             # Output path
             output_layout = QHBoxLayout()
@@ -768,6 +960,72 @@ def run_gui() -> None:
             if file:
                 self.output_input.setText(file)
         
+        def load_metadata_dialog(self):
+            """Open file dialog to load metadata JSON."""
+            file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Metadata JSON File",
+                "",
+                "JSON Files (*.json);;All Files (*)"
+            )
+            if file:
+                self.load_metadata_from_file(Path(file))
+        
+        def load_metadata_from_file(self, json_path: Path):
+            """Load settings from a metadata JSON file and populate GUI."""
+            try:
+                metadata = load_run_metadata(json_path)
+                
+                # Verify input file checksums
+                input_checksums = metadata.get("input_checksums", {})
+                missing_files = []
+                checksum_mismatches = []
+                
+                for file_path_str, expected_checksum in input_checksums.items():
+                    file_path = Path(file_path_str)
+                    if not file_path.exists():
+                        missing_files.append(file_path_str)
+                    else:
+                        actual_checksum = compute_file_md5(file_path)
+                        if actual_checksum != expected_checksum:
+                            checksum_mismatches.append(file_path_str)
+                
+                # Show warnings if issues found
+                warnings = []
+                if missing_files:
+                    warnings.append(f"⚠ Missing input files:\n" + "\n".join(missing_files))
+                if checksum_mismatches:
+                    warnings.append(f"⚠ Input files have changed (checksum mismatch):\n" + "\n".join(checksum_mismatches))
+                
+                if warnings:
+                    msg = "\n\n".join(warnings) + "\n\nContinue loading settings anyway?"
+                    reply = QMessageBox.warning(self, "Input File Issues", msg, QMessageBox.Yes | QMessageBox.No)
+                    if reply == QMessageBox.No:
+                        return
+                
+                # Load settings
+                settings = metadata.get("settings", {})
+                
+                self.output_input.setText(metadata.get("output_file", "verbs.csv"))
+                self.model_combo.setCurrentText(settings.get("model", "en_core_web_sm"))
+                self.encoding_combo.setCurrentText(settings.get("encoding", "utf-8"))
+                self.chunk_size_spin.setValue(settings.get("chunk_size", 2_000_000))
+                self.overlap_spin.setValue(settings.get("overlap", 5_000))
+                self.dedupe_spin.setValue(settings.get("dedupe_window", 50_000))
+                self.heartbeat_spin.setValue(settings.get("heartbeat_chunks", 10))
+                self.include_aux_check.setChecked(settings.get("include_aux", False))
+                self.tsv_check.setChecked(settings.get("output_format", "csv") == "tsv")
+                
+                self.log(f"✓ Loaded metadata from: {json_path}")
+                if warnings:
+                    for w in warnings:
+                        self.log(w)
+                else:
+                    self.log("✓ All input files verified (checksum OK)")
+                    
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load metadata: {str(e)}")
+        
         def log(self, message: str):
             """Append a message to the log output."""
             self.log_text.append(message)
@@ -790,6 +1048,29 @@ def run_gui() -> None:
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Cannot create output directory: {str(e)}")
                 return
+            
+            # Check if any input files match metadata (if metadata was loaded)
+            # This warning happens before clearing the log, so user sees it
+            metadata_path = output_path.with_suffix(".json")
+            if metadata_path.exists():
+                try:
+                    metadata = load_run_metadata(metadata_path)
+                    issues = verify_input_file_checksums(self.input_files, metadata)
+                    
+                    if issues["missing_files"] or issues["checksum_mismatches"]:
+                        warnings = []
+                        if issues["missing_files"]:
+                            warnings.append(f"⚠ Missing from metadata:\n" + "\n".join(issues["missing_files"]))
+                        if issues["checksum_mismatches"]:
+                            warnings.append(f"⚠ Changed since last run (checksum mismatch):\n" + "\n".join(issues["checksum_mismatches"]))
+                        
+                        msg = "\n\n".join(warnings) + "\n\nContinue with extraction?"
+                        reply = QMessageBox.warning(self, "Input File Checksum Mismatch", msg, QMessageBox.Yes | QMessageBox.No)
+                        if reply == QMessageBox.No:
+                            return
+                except Exception as e:
+                    # Metadata issues shouldn't block extraction
+                    pass
             
             # Clear log
             self.log_text.clear()
