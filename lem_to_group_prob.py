@@ -2,22 +2,27 @@
 """
 Aggregate group probabilities by lemma (auto-detect group columns).
 
-Input: CSV produced by roberta_mlm_on_verbs.py with groups enabled.
-Output (default): CSV with one row per lemma and mean group probability per group.
+Input: CSV produced by roberta_mlm_on_verbs.py with group columns appended.
 
-If --excel is provided, also write an .xlsx with two sheets:
-  1) lemma_to_groups: lemma -> group percentages (Excel % formatting) + count
-  2) groups_ranked: for each group, two columns (lemma, pct) sorted by decreasing pct
+Output:
+  - If output filename ends with .csv  → write CSV
+  - If output filename ends with .xlsx → write Excel (two sheets)
 
-Defaults:
-  - If output_csv is omitted, writes: <input_basename>.group_means.csv
-  - If --excel is provided without a filename, writes: <input_basename>.group_means.xlsx
+Excel sheets:
+  1) lemma_to_groups:
+        lemma → mean group probabilities (formatted as %) + count
+        - bold the highest group percentage in each row
+        - color the lemma cell BLUE if the 2nd-highest group percentage is at least
+          --second-threshold (default 0.50) times the highest
+  2) groups_ranked:
+        for each group: (lemma, pct) sorted by decreasing pct,
+        with the lemma bolded in the group where it has the highest probability
 
 Auto-detection:
   - If --group-cols is provided, use it.
   - Otherwise infer group columns by taking all columns after the last prob_k column.
 
-Requirements for --excel:
+Requirements for Excel output:
   pip install openpyxl
 """
 
@@ -28,11 +33,12 @@ import csv
 import os
 import re
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
-
+from typing import Dict, List, Tuple
 
 PROB_COL_RE = re.compile(r"^prob_(\d+)$")
 
+
+# ------------------------- helpers -------------------------
 
 def infer_group_cols(fieldnames: List[str]) -> List[str]:
     """Infer group columns as those appearing after the last prob_k column."""
@@ -42,109 +48,120 @@ def infer_group_cols(fieldnames: List[str]) -> List[str]:
             last_prob_idx = i
     if last_prob_idx == -1:
         return []
-    return [c for c in fieldnames[last_prob_idx + 1 :] if c.strip()]
-
-
-def default_output_csv_name(input_csv: str) -> str:
-    base, _ = os.path.splitext(input_csv)
-    return f"{base}.group_means.csv"
-
-
-def default_output_xlsx_name(input_csv: str) -> str:
-    base, _ = os.path.splitext(input_csv)
-    return f"{base}.group_means.xlsx"
+    return [c for c in fieldnames[last_prob_idx + 1:] if c.strip()]
 
 
 def safe_sheet_title(s: str) -> str:
-    # Excel sheet name limits: <=31 chars, no : \ / ? * [ ]
     bad = r'[]:*?/\\'
     out = "".join("_" if ch in bad else ch for ch in s)
-    return out[:31] if len(out) > 31 else out
+    return out[:31]
 
+
+# ------------------------- Excel writer -------------------------
 
 def write_excel(
     xlsx_path: str,
     lemma_col: str,
     group_cols: List[str],
     counts: Dict[str, int],
-    means: Dict[str, Dict[str, float]],  # means[group][lemma] -> float
+    means: Dict[str, Dict[str, float]],
+    best_group_for_lemma: Dict[str, str],
+    second_threshold: float,
 ) -> None:
     try:
         from openpyxl import Workbook
-        from openpyxl.utils import get_column_letter
         from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
     except ImportError as e:
-        raise SystemExit("openpyxl is required for --excel. Install with: pip install openpyxl") from e
+        raise SystemExit(
+            "Excel output requested but openpyxl is not installed. Install with: pip install openpyxl"
+        ) from e
 
     wb = Workbook()
+    bold_font = Font(bold=True)
+    blue_font = Font(color="0000FF")  # blue text
+    header_font = Font(bold=True)
+    header_align = Alignment(vertical="center")
 
-    # ---------------- Sheet 1: lemma_to_groups ----------------
+    # ---------- Sheet 1: lemma_to_groups ----------
     ws1 = wb.active
     ws1.title = safe_sheet_title("lemma_to_groups")
 
-    header1 = [lemma_col] + group_cols + ["count"]
-    ws1.append(header1)
-
-    bold = Font(bold=True)
+    header = [lemma_col] + group_cols + ["count"]
+    ws1.append(header)
     for cell in ws1[1]:
-        cell.font = bold
-        cell.alignment = Alignment(vertical="center")
+        cell.font = header_font
+        cell.alignment = header_align
 
-    # Write rows
-    for lemma in sorted(counts.keys()):
-        row = [lemma]
-        for g in group_cols:
-            row.append(means[g].get(lemma, 0.0))
-        row.append(counts[lemma])
-        ws1.append(row)
+    # Write rows + apply formatting rules
+    # Columns:
+    #   lemma = 1
+    #   groups = 2..(1+len(group_cols))
+    #   count = last
+    for lemma in sorted(counts):
+        row_vals = [lemma] + [means[g][lemma] for g in group_cols] + [counts[lemma]]
+        ws1.append(row_vals)
+        r = ws1.max_row
 
-    # Format % columns
-    # lemma_col at A; groups are B..; count is last
+        # Determine max/2nd-max across groups for this lemma
+        group_vals = [(g, means[g][lemma]) for g in group_cols]
+        # stable sort: highest first
+        group_vals.sort(key=lambda x: x[1], reverse=True)
+        max_g, max_v = group_vals[0]
+        second_v = group_vals[1][1] if len(group_vals) > 1 else 0.0
+
+        # Bold the max group cell in this row
+        max_idx = group_cols.index(max_g)  # 0-based within group_cols
+        max_col = 2 + max_idx  # Excel column index for the group cell
+        ws1.cell(row=r, column=max_col).font = bold_font
+
+        # If 2nd-highest >= threshold * highest, color lemma cell blue
+        # Avoid dividing by zero: if max_v == 0, treat as "not ambiguous"
+        if max_v > 0 and second_v >= (second_threshold * max_v):
+            ws1.cell(row=r, column=1).font = blue_font
+
+    # Percent formatting for group columns
     for j in range(2, 2 + len(group_cols)):
         for i in range(2, ws1.max_row + 1):
             ws1.cell(row=i, column=j).number_format = "0.00%"
 
-    # Freeze panes and autofilter
     ws1.freeze_panes = "A2"
     ws1.auto_filter.ref = f"A1:{get_column_letter(ws1.max_column)}{ws1.max_row}"
 
-    # Reasonable column widths
-    ws1.column_dimensions["A"].width = max(12, min(40, max(len(lemma_col), 12)))
-    for idx, g in enumerate(group_cols, start=2):
-        ws1.column_dimensions[get_column_letter(idx)].width = max(12, min(24, len(g) + 2))
-    ws1.column_dimensions[get_column_letter(ws1.max_column)].width = 10  # count
-
-    # ---------------- Sheet 2: groups_ranked ----------------
+    # ---------- Sheet 2: groups_ranked ----------
     ws2 = wb.create_sheet(title=safe_sheet_title("groups_ranked"))
 
-    # Build sorted lists per group: [(lemma, pct), ...] descending pct
     per_group_sorted: Dict[str, List[Tuple[str, float]]] = {}
     max_len = 0
     for g in group_cols:
-        items = [(lemma, means[g].get(lemma, 0.0)) for lemma in counts.keys()]
+        items = [(lemma, means[g][lemma]) for lemma in counts]
         items.sort(key=lambda x: x[1], reverse=True)
         per_group_sorted[g] = items
         max_len = max(max_len, len(items))
 
-    # Header: two cols per group
     header2: List[str] = []
     for g in group_cols:
         header2.extend([f"{g}_lemma", f"{g}_pct"])
     ws2.append(header2)
     for cell in ws2[1]:
-        cell.font = bold
-        cell.alignment = Alignment(vertical="center")
+        cell.font = header_font
+        cell.alignment = header_align
 
-    # Rows: align by rank index
     for r in range(max_len):
-        row: List[Optional[object]] = []
-        for g in group_cols:
-            lemma, pct = per_group_sorted[g][r]
-            row.extend([lemma, pct])
-        ws2.append(row)
+        ws2.append([None] * (2 * len(group_cols)))
+        excel_row = ws2.max_row
 
-    # Format every *_pct column as percentage
-    # pct columns are 2,4,6,... (1-indexed in Excel columns)
+        for k, g in enumerate(group_cols):
+            lemma, pct = per_group_sorted[g][r]
+            lemma_col_idx = 1 + 2 * k
+            pct_col_idx = 2 + 2 * k
+
+            cell_lemma = ws2.cell(row=excel_row, column=lemma_col_idx, value=lemma)
+            ws2.cell(row=excel_row, column=pct_col_idx, value=pct)
+
+            if best_group_for_lemma.get(lemma) == g:
+                cell_lemma.font = bold_font
+
     for col in range(2, 2 * len(group_cols) + 1, 2):
         for i in range(2, ws2.max_row + 1):
             ws2.cell(row=i, column=col).number_format = "0.00%"
@@ -152,25 +169,15 @@ def write_excel(
     ws2.freeze_panes = "A2"
     ws2.auto_filter.ref = f"A1:{get_column_letter(ws2.max_column)}{ws2.max_row}"
 
-    # Column widths for pairs
-    for k, g in enumerate(group_cols):
-        lemma_col_idx = 1 + 2 * k
-        pct_col_idx = 2 + 2 * k
-        ws2.column_dimensions[get_column_letter(lemma_col_idx)].width = max(12, min(28, len(g) + 6))
-        ws2.column_dimensions[get_column_letter(pct_col_idx)].width = 12
-
     wb.save(xlsx_path)
 
+
+# ------------------------- main -------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("input_csv", help="MLM output CSV with group columns appended")
-    ap.add_argument(
-        "output_csv",
-        nargs="?",
-        default=None,
-        help="Output CSV (default: <input>.group_means.csv)",
-    )
+    ap.add_argument("output", help="Output filename (.csv or .xlsx)")
     ap.add_argument("--lemma-col", default="lemma", help="Lemma column name (default: lemma)")
     ap.add_argument(
         "--group-cols",
@@ -179,23 +186,22 @@ def main() -> None:
         help="Optional explicit group column names; otherwise inferred from header",
     )
     ap.add_argument(
-        "--excel",
-        nargs="?",
-        const="__AUTO__",
-        default=None,
-        help="Also write an Excel .xlsx (optional filename; default: <input>.group_means.xlsx)",
+        "--second-threshold",
+        type=float,
+        default=0.50,
+        help="Color lemma blue if 2nd-best >= threshold * best (default: 0.50)",
     )
     ap.add_argument("--encoding", default="utf-8")
     args = ap.parse_args()
 
-    output_csv = args.output_csv or default_output_csv_name(args.input_csv)
-    excel_path: Optional[str] = None
-    if args.excel is not None:
-        excel_path = default_output_xlsx_name(args.input_csv) if args.excel == "__AUTO__" else args.excel
-        if not excel_path.lower().endswith(".xlsx"):
-            excel_path += ".xlsx"
+    if not (0.0 <= args.second_threshold <= 1.0):
+        raise SystemExit("--second-threshold must be between 0 and 1.")
 
-    # Pass 1: read + accumulate sums and counts
+    out_ext = os.path.splitext(args.output)[1].lower()
+    if out_ext not in {".csv", ".xlsx"}:
+        raise SystemExit("Output filename must end with .csv or .xlsx")
+
+    # ---------- read + aggregate ----------
     with open(args.input_csv, newline="", encoding=args.encoding) as fin:
         reader = csv.DictReader(fin)
         if reader.fieldnames is None:
@@ -206,14 +212,7 @@ def main() -> None:
 
         group_cols = args.group_cols or infer_group_cols(reader.fieldnames)
         if not group_cols:
-            raise SystemExit(
-                "Could not infer group columns. Either groups were not appended or prob_k columns are missing. "
-                "Provide --group-cols explicitly."
-            )
-
-        missing = [g for g in group_cols if g not in reader.fieldnames]
-        if missing:
-            raise SystemExit(f"Missing group columns in input: {missing}")
+            raise SystemExit("Could not infer group columns. Provide --group-cols explicitly.")
 
         sums: Dict[str, Dict[str, float]] = {g: defaultdict(float) for g in group_cols}
         counts: Dict[str, int] = defaultdict(int)
@@ -233,36 +232,38 @@ def main() -> None:
                 except ValueError:
                     pass
 
-    # Compute means[group][lemma]
-    means: Dict[str, Dict[str, float]] = {g: {} for g in group_cols}
-    for lemma, c in counts.items():
-        for g in group_cols:
-            means[g][lemma] = (sums[g][lemma] / c) if c else 0.0
+    means: Dict[str, Dict[str, float]] = {
+        g: {lemma: (sums[g][lemma] / counts[lemma]) for lemma in counts}
+        for g in group_cols
+    }
 
-    # Write CSV
-    out_fields = [args.lemma_col] + group_cols + ["count"]
-    with open(output_csv, "w", newline="", encoding=args.encoding) as fout:
-        writer = csv.DictWriter(fout, fieldnames=out_fields)
-        writer.writeheader()
-        for lemma in sorted(counts):
-            c = counts[lemma]
-            row = {args.lemma_col: lemma, "count": c}
-            for g in group_cols:
-                row[g] = f"{means[g][lemma]:.10g}"
-            writer.writerow(row)
+    best_group_for_lemma: Dict[str, str] = {}
+    for lemma in counts:
+        best_group_for_lemma[lemma] = max(group_cols, key=lambda g: means[g][lemma])
 
-    print(f"Wrote {output_csv}")
-
-    # Write Excel if requested
-    if excel_path:
+    # ---------- write output ----------
+    if out_ext == ".csv":
+        with open(args.output, "w", newline="", encoding=args.encoding) as fout:
+            writer = csv.DictWriter(
+                fout,
+                fieldnames=[args.lemma_col] + group_cols + ["count"],
+            )
+            writer.writeheader()
+            for lemma in sorted(counts):
+                row = {args.lemma_col: lemma, "count": counts[lemma]}
+                for g in group_cols:
+                    row[g] = f"{means[g][lemma]:.10g}"
+                writer.writerow(row)
+    else:
         write_excel(
-            xlsx_path=excel_path,
+            xlsx_path=args.output,
             lemma_col=args.lemma_col,
             group_cols=group_cols,
             counts=counts,
             means=means,
+            best_group_for_lemma=best_group_for_lemma,
+            second_threshold=args.second_threshold,
         )
-        print(f"Wrote {excel_path}")
 
 
 if __name__ == "__main__":

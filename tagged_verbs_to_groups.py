@@ -49,10 +49,26 @@ def read_and_group(input_path: str, ignore = None) -> Tuple[List[str], Dict[str,
                 f"Expected first two headers to be 'lemma' and 'frequency' (or 'freq'). Got: {header[:2]}"
             )
 
-        group_labels = [h.strip() for h in header[2:] if h.strip() if h.strip() not in ignore]
+        # Build a case-insensitive ignore set
+        ignore_set = {s.strip().lower() for s in ignore} if ignore else set()
+
+        # All group headers (columns after lemma and frequency)
+        total_group_cols = max(0, len(header) - 2)
+        all_group_headers = [h.strip() for h in header[2:]]
+
+        # Determine which group-column indices to keep (relative indices 0..total_group_cols-1)
+        # active_cols is a list of (relative_index, label) for non-ignored, non-empty labels
+        active_cols = [
+            (idx, lbl)
+            for idx, lbl in enumerate(all_group_headers)
+            if lbl and lbl.lower() not in ignore_set
+        ]
+
+        group_labels = [label for (_idx, label) in active_cols]
         if not group_labels:
-            raise ValueError("No group labels found after the frequency column.")
+            raise ValueError("No group labels found after the frequency column (after applying ignore).")
         logger.info(f"Found group labels: {group_labels}")
+
         # Initialize keys so empty groups still appear in output
         for g in group_labels:
             groups_to_lemmas[g] = []
@@ -63,14 +79,19 @@ def read_and_group(input_path: str, ignore = None) -> Tuple[List[str], Dict[str,
             if not row or all(cell.strip() == "" for cell in row):
                 continue  # skip blank lines
 
-            # Pad short rows so row[2:] aligns with group_labels length
             if len(row) < 2:
                 print(f"Warning: line {line_no}: too few columns; skipping.", file=sys.stderr)
                 continue
-            if len(row) < 2 + len(group_labels):
-                row = row + [""] * (2 + len(group_labels) - len(row))
+
+            # Pad/truncate so we can index all original group columns by relative position
+            if len(row) < 2 + total_group_cols:
+                row = row + [""] * (2 + total_group_cols - len(row))
             else:
-                row = row[: 2 + len(group_labels)]  # ignore any extra columns
+                row = row[: 2 + total_group_cols]
+
+            # Rebuild the row to contain only: lemma, frequency, and the non-ignored group columns (in order)
+            # This preserves the existing downstream logic that expects row[2:] to align with group_labels.
+            row = row[:2] + [row[2 + idx] for idx, _ in active_cols]
 
             lemma = row[0].strip()
             if not lemma:
@@ -143,7 +164,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        group_labels, groups_to_lemmas = read_and_group(args.input_csv)
+        group_labels, groups_to_lemmas = read_and_group(args.input_csv,ignore=args.ignore)
         write_columnar_output(args.output_csv, group_labels, groups_to_lemmas)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -21,7 +21,7 @@ Streaming-friendly:
   - holds only a small batch in memory
 
 Requirements:
-  pip install transformers torch
+  pip install transformers torch lemminflect
 
 Example:
   python roberta_mlm_on_verbs.py verbs.csv verbs_with_mlm.csv --model roberta-base --batch-size 16 --top-k 10
@@ -43,9 +43,7 @@ from typing import Dict, List, Tuple, Optional, Set
 
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
-
 from lemminflect import getLemma
-
 
 
 # --------------------------- helpers ---------------------------
@@ -79,22 +77,23 @@ def normalize_pred_token(tok: str) -> str:
     Steps:
       1) basic cleanup + lowercase
       2) lemmatize via lemminflect (best-effort)
-         - if lemminflect returns multiple lemmas, take the first
-         - if it returns nothing, fall back to the cleaned token
+         - prefer VERB lemmas when possible
+         - if multiple lemmas returned, take the first
+         - if none returned, fall back to the cleaned token
     """
     t = tok.strip().lower()
 
-    # Optional: fast path for empty / punctuation-only
-    if not t or all(not ch.isalnum() for ch in t):
+    if not t:
+        return t
+    if all(not ch.isalnum() for ch in t):
         return t
 
-    # lemminflect expects a surface form and returns a tuple of candidate lemmas
-    # e.g., getLemma("running") -> ("run",)
-    lemmas = getLemma(t,upos="VERB")
+    lemmas = getLemma(t, upos="VERB") or getLemma(t)
     if lemmas:
         return lemmas[0].lower()
 
     return t
+
 
 def load_groups_csv(path: str, encoding: str, logger: logging.Logger) -> Tuple[List[str], Dict[str, Set[str]]]:
     """
@@ -118,19 +117,16 @@ def load_groups_csv(path: str, encoding: str, logger: logging.Logger) -> Tuple[L
 
         lemma_to_groups: Dict[str, Set[str]] = {}
 
-        for row_idx, row in enumerate(reader, start=2):
-            # pad/trim to header length for safety
+        for row in reader:
             row = (row + [""] * len(headers))[:len(headers)]
             for col_idx, cell in enumerate(row):
                 lemma = cell.strip()
                 if not lemma:
                     continue
-                if col_idx >= len(headers):
-                    continue
-                group = headers[col_idx].strip()
+                group = headers[col_idx].strip() if col_idx < len(headers) else ""
                 if not group:
                     continue
-                key = normalize_pred_token(lemma)
+                key = lemma.strip().lower()
                 lemma_to_groups.setdefault(key, set()).add(group)
 
         logger.info(
@@ -265,10 +261,24 @@ def main() -> None:
         pred_cols.extend([f"token_{i}", f"prob_{i}"])
 
     needed_cols = {"sentence", "span_in_sentence_char"}
+
     processed = 0
     skipped = 0
+    seen = 0
+    next_log_at = args.log_every
 
     pending: List[PendingRow] = []
+
+    def maybe_log_progress(force: bool = False) -> None:
+        nonlocal next_log_at
+        if args.log_every <= 0:
+            return
+        if force:
+            logger.info(f"Rows seen: {seen:,} | written: {processed:,} | skipped: {skipped:,}")
+            return
+        while seen >= next_log_at and next_log_at > 0:
+            logger.info(f"Rows seen: {seen:,} | written: {processed:,} | skipped: {skipped:,}")
+            next_log_at += args.log_every
 
     with open(args.input_csv, newline="", encoding=args.encoding) as fin, \
          open(args.output_csv, "w", newline="", encoding=args.encoding) as fout:
@@ -288,7 +298,6 @@ def main() -> None:
             for g in group_labels:
                 colname = g
                 if colname in existing:
-                    # auto-disambiguate
                     colname = f"{g}_group"
                     logger.warning(f"Group name {g!r} collides with existing column; writing as {colname!r}")
                 group_colname_map[g] = colname
@@ -296,11 +305,14 @@ def main() -> None:
                 existing.add(colname)
 
         out_fieldnames = list(reader.fieldnames) + pred_cols + group_out_cols
+        logger.info(f"Group columns enabled: {bool(group_out_cols)}")
+        if group_out_cols:
+            logger.info(f"Writing {len(group_out_cols)} group columns: {group_out_cols}")
         writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
         writer.writeheader()
 
         def flush_batch(batch: List[PendingRow]) -> None:
-            nonlocal processed, skipped
+            nonlocal processed
             texts = [pr.masked_text for pr in batch]
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -317,7 +329,7 @@ def main() -> None:
                     out_row[f"token_{j}"] = tok
                     out_row[f"prob_{j}"] = f"{prob:.10g}"
 
-                # if groups enabled: sum probabilities of predicted tokens that match any group lemma
+                # if groups enabled: sum probabilities of predicted tokens (lemmatized) that match group lemmas
                 if group_labels:
                     group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
                     for tok, prob in pr_preds:
@@ -335,6 +347,8 @@ def main() -> None:
                 processed += 1
 
         for row_idx, row in enumerate(reader, start=1):
+            seen += 1
+
             if args.debug_limit and (processed + skipped) >= args.debug_limit:
                 logger.info(f"Debug limit reached ({args.debug_limit}); stopping early.")
                 break
@@ -344,7 +358,6 @@ def main() -> None:
                 span = row["span_in_sentence_char"]
 
                 masked_raw = mask_sentence(raw_sent, span, mask_token)
-                # Keep your earlier leading-space behavior (often helps RoBERTa) but preserve for debugging
                 masked = " " + masked_raw.strip()
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -357,18 +370,22 @@ def main() -> None:
                 skipped += 1
                 if skipped <= 10:
                     logger.warning(f"Skipping row {row_idx} due to error: {e}")
+                maybe_log_progress()
                 continue
 
             if len(pending) >= args.batch_size:
                 flush_batch(pending)
                 pending.clear()
+                maybe_log_progress()
 
-            if (processed + skipped) % args.log_every == 0 and (processed + skipped) > 0:
-                logger.info(f"Rows seen: {processed + skipped:,} | written: {processed:,} | skipped: {skipped:,}")
+            else:
+                maybe_log_progress()
 
         if pending and (not args.debug_limit or (processed + skipped) < args.debug_limit):
             flush_batch(pending)
             pending.clear()
+
+        maybe_log_progress(force=True)
 
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
 
