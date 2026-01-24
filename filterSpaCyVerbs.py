@@ -87,10 +87,10 @@ def save_filter_metadata(
         json.dump(metadata, f, indent=2)
 
 
-def load_filter_metadata(json_path: Path) -> Dict:
+def load_filter_metadata(json_path: Path) -> dict[Any, Any]:
     """Load filtering metadata from JSON file."""
     with json_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        return dict(json.load(f))
 
 
 def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
