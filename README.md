@@ -374,3 +374,24 @@ pip install openpyxl
 - Group files are expected to be ragged CSVs (variable column lengths per row)
 - Character spans are zero-indexed, end-exclusive (`start:end` format)
 - RoBERTa predictions are normalized and lemmatized for group matching
+
+---
+
+## Testing
+
+- Minimal harness:
+     - `tests/run_tests.py` bootstraps a local virtualenv, installs `openpyxl` and `lemminflect`, generates sample CSVs, and validates both CSV and XLSX outputs including the "Groups" sheet.
+     - Run:
+          ```bash
+          python3 tests/run_tests.py
+          ```
+
+- Pytest suite:
+     - `tests/test_mlm_group_aggregator.py` contains two tests (CSV and XLSX). Each test creates an isolated venv for dependencies and runs `MLMGroupAggregator.py` end-to-end.
+     - Quick-start with a local venv:
+          ```bash
+          python3 -m venv .venv_pytest
+          ./.venv_pytest/bin/python -m pip install --upgrade pip
+          ./.venv_pytest/bin/python -m pip install pytest
+          ./.venv_pytest/bin/python -m pytest -q
+          ```

@@ -19,6 +19,7 @@ Output modes:
 Requirements:
   pip install lemminflect
   pip install PySide6  # for GUI mode only
+    pip install openpyxl  # for XLSX output (optional)
 
 CLI Examples:
   python MLMGroupAggregator.py mlm_out.csv groups.csv output.csv
@@ -158,10 +159,129 @@ def verify_input_checksums(
     return status, message
 
 
+def _write_groups_sheet_openpyxl(wb, group_labels: List[str], lemma_to_groups: Dict[str, Set[str]]) -> None:
+    """
+    Add a sheet named "Groups" to the provided openpyxl workbook with
+    columns for each group label and rows listing lemmas belonging to
+    that group. Lemmas are sorted alphabetically per group.
+    """
+    ws = wb.create_sheet("Groups")
+    ws.append(group_labels)
+    group_to_lemmas: Dict[str, List[str]] = {g: [] for g in group_labels}
+    for lemma, groups in lemma_to_groups.items():
+        for g in groups:
+            if g in group_to_lemmas:
+                group_to_lemmas[g].append(lemma)
+    for g in group_labels:
+        group_to_lemmas[g].sort()
+    max_len = max((len(v) for v in group_to_lemmas.values()), default=0)
+    for i in range(max_len):
+        row = [group_to_lemmas[g][i] if i < len(group_to_lemmas[g]) else "" for g in group_labels]
+        ws.append(row)
+
+
 # ============================================================================
 # CORE LOGIC (shared by CLI and GUI)
 # ============================================================================
 
+
+def normalize_pred_token(tok: str) -> str:
+    """Normalize an MLM prediction token to a lemma key used by groups.
+
+    - Strips common subword markers (e.g., 'Ġ', '▁').
+    - Lowercases the token.
+    - Lemmatizes as a verb using lemminflect's getLemma.
+    """
+    if tok is None:
+        return ""
+    s = tok.strip()
+    if not s:
+        return ""
+    # Strip common RoBERTa/SentencePiece markers
+    if s.startswith("Ġ"):
+        s = s[1:]
+    if s.startswith("▁"):
+        s = s[1:]
+    s = s.strip().lower()
+    if not s:
+        return ""
+    try:
+        lemmas = getLemma(s, "VERB")
+        if lemmas:
+            return (lemmas[0] or s).lower()
+    except Exception:
+        pass
+    return s
+
+
+def load_groups_csv(group_csv_path: str, encoding: str, logger: logging.Logger) -> Tuple[List[str], Dict[str, Set[str]]]:
+    """Load groups from a wide CSV (columns=groups, rows=list lemmas) into mapping.
+
+    Returns:
+        (group_labels, lemma_to_groups)
+    """
+    p = Path(group_csv_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Group CSV not found: {p}")
+    with p.open("r", newline="", encoding=encoding) as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if not header:
+            raise ValueError("Group CSV is empty or missing header row")
+        group_labels: List[str] = [h.strip() for h in header if h and h.strip()]
+        lemma_to_groups: Dict[str, Set[str]] = {}
+        for row in reader:
+            for idx, g in enumerate(group_labels):
+                if idx >= len(row):
+                    continue
+                cell = (row[idx] or "").strip()
+                if not cell:
+                    continue
+                key = normalize_pred_token(cell)
+                if not key:
+                    continue
+                s = lemma_to_groups.get(key)
+                if s is None:
+                    s = set()
+                    lemma_to_groups[key] = s
+                s.add(g)
+    logger.info(f"Loaded {len(group_labels)} groups; {len(lemma_to_groups)} unique lemmas mapped")
+    return group_labels, lemma_to_groups
+
+
+def infer_top_k(fieldnames: List[str]) -> int:
+    """Infer top_k from fieldnames by counting prob_i columns."""
+    max_k = 0
+    for name in fieldnames:
+        m = PROB_COL_RE.match(name)
+        if m:
+            try:
+                idx = int(m.group(1))
+                if idx > max_k:
+                    max_k = idx
+            except Exception:
+                continue
+    return max_k
+
+
+def build_group_output_columns(fieldnames: List[str], group_labels: List[str]) -> Tuple[List[str], Dict[str, str]]:
+    """Create safe output column names for each group and a mapping from group->column.
+
+    Ensures names don't collide with existing fieldnames by appending numeric suffixes if needed.
+    """
+    existing = set(fieldnames)
+    out_cols: List[str] = []
+    col_map: Dict[str, str] = {}
+    for g in group_labels:
+        base = f"group_prob_{g}"
+        name = base
+        suffix = 1
+        while name in existing or name in out_cols:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        out_cols.append(name)
+        col_map[g] = name
+    return out_cols, col_map
 
 # ============================================================================
 # CLI MODE
@@ -250,21 +370,19 @@ def run_cli() -> None:
     skipped = 0
     lemma_counts: Dict[str, int] = {}
     
-    with mlm_path.open(newline="", encoding=args.encoding) as fin, \
-         output_path.open("w", newline="", encoding=args.encoding) as fout:
-        
+    with mlm_path.open(newline="", encoding=args.encoding) as fin:
         reader = csv.DictReader(fin)
         if reader.fieldnames is None:
             raise SystemExit("Input MLM CSV has no header.")
         fieldnames = reader.fieldnames
-        
+
         if args.lemma_col not in fieldnames:
             raise SystemExit(f"Input MLM CSV missing lemma column {args.lemma_col!r}")
-        
+
         k = args.top_k if args.top_k > 0 else infer_top_k(fieldnames)
         if k <= 0:
             raise SystemExit("Could not infer top_k from header; provide --top-k explicitly.")
-        
+
         # Verify required token/prob columns
         missing_cols = []
         for i in range(1, k + 1):
@@ -277,68 +395,137 @@ def run_cli() -> None:
                 f"Missing required token/prob columns for top_k={k}: "
                 f"{missing_cols[:10]}{' ...' if len(missing_cols) > 10 else ''}"
             )
-        
+
         # Build output columns
         group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
-        
+
         if args.short:
             out_fieldnames = [args.lemma_col] + group_out_cols
             if args.include_count:
                 out_fieldnames.append("lemma_count")
         else:
             out_fieldnames = list(fieldnames) + group_out_cols
-        
-        writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
-        writer.writeheader()
-        
-        for row in reader:
+
+        is_xlsx = output_path.suffix.lower() == ".xlsx"
+
+        if is_xlsx:
             try:
-                lemma = (row.get(args.lemma_col) or "").strip()
-                if not lemma:
-                    raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
-                
-                group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
-                
-                for i in range(1, k + 1):
-                    tok = row.get(f"token_{i}", "")
-                    p_str = row.get(f"prob_{i}", "")
-                    if not tok or not p_str:
-                        continue
+                from openpyxl import Workbook
+            except ImportError:
+                raise SystemExit(
+                    "XLSX output requested but openpyxl is not installed. Install with: pip install openpyxl"
+                )
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Aggregated"
+            ws.append(out_fieldnames)
+
+            for row in reader:
+                try:
+                    lemma = (row.get(args.lemma_col) or "").strip()
+                    if not lemma:
+                        raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
+
+                    group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+                    for i in range(1, k + 1):
+                        tok = row.get(f"token_{i}", "")
+                        p_str = row.get(f"prob_{i}", "")
+                        if not tok or not p_str:
+                            continue
+                        try:
+                            prob = float(p_str)
+                        except ValueError:
+                            continue
+
+                        key = normalize_pred_token(tok)
+                        gs = lemma_to_groups.get(key)
+                        if not gs:
+                            continue
+                        for g in gs:
+                            group_sums[g] += prob
+
+                    if args.short:
+                        out_row = {args.lemma_col: lemma}
+                        for g in group_labels:
+                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+                        if args.include_count:
+                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                            out_row["lemma_count"] = str(lemma_counts[lemma])
+                    else:
+                        out_row = dict(row)
+                        for g in group_labels:
+                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+                    ws.append([out_row.get(col, "") for col in out_fieldnames])
+                    processed += 1
+
+                except Exception as e:
+                    skipped += 1
+                    if skipped <= 10:
+                        logger.warning(f"Skipping row due to error: {e}")
+                    continue
+
+                if args.log_every > 0 and processed % args.log_every == 0:
+                    logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+
+            # Add groups sheet and save workbook
+            _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
+            wb.save(str(output_path))
+
+        else:
+            with output_path.open("w", newline="", encoding=args.encoding) as fout:
+                writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
+                writer.writeheader()
+
+                for row in reader:
                     try:
-                        prob = float(p_str)
-                    except ValueError:
+                        lemma = (row.get(args.lemma_col) or "").strip()
+                        if not lemma:
+                            raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
+
+                        group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+                        for i in range(1, k + 1):
+                            tok = row.get(f"token_{i}", "")
+                            p_str = row.get(f"prob_{i}", "")
+                            if not tok or not p_str:
+                                continue
+                            try:
+                                prob = float(p_str)
+                            except ValueError:
+                                continue
+
+                            key = normalize_pred_token(tok)
+                            gs = lemma_to_groups.get(key)
+                            if not gs:
+                                continue
+                            for g in gs:
+                                group_sums[g] += prob
+
+                        if args.short:
+                            out_row = {args.lemma_col: lemma}
+                            for g in group_labels:
+                                out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+                            if args.include_count:
+                                lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                out_row["lemma_count"] = str(lemma_counts[lemma])
+                        else:
+                            out_row = dict(row)
+                            for g in group_labels:
+                                out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+                        writer.writerow(out_row)
+                        processed += 1
+
+                    except Exception as e:
+                        skipped += 1
+                        if skipped <= 10:
+                            logger.warning(f"Skipping row due to error: {e}")
                         continue
-                    
-                    key = normalize_pred_token(tok)
-                    gs = lemma_to_groups.get(key)
-                    if not gs:
-                        continue
-                    for g in gs:
-                        group_sums[g] += prob
-                
-                if args.short:
-                    out_row = {args.lemma_col: lemma}
-                    for g in group_labels:
-                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                    if args.include_count:
-                        lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                        out_row["lemma_count"] = str(lemma_counts[lemma])
-                else:
-                    out_row = dict(row)
-                    for g in group_labels:
-                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                
-                writer.writerow(out_row)
-                processed += 1
-            
-            except Exception as e:
-                skipped += 1
-                if skipped <= 10:
-                    logger.warning(f"Skipping row due to error: {e}")
-                continue
-            
-            if args.log_every > 0 and processed % args.log_every == 0:
-                logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+
+                    if args.log_every > 0 and processed % args.log_every == 0:
+                        logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
     
     elapsed_time = time.time() - start_time
     
@@ -354,6 +541,7 @@ def run_cli() -> None:
         "short": args.short,
         "include_count": args.include_count,
         "encoding": args.encoding,
+        "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
     }
     
     stats = {
@@ -458,81 +646,147 @@ def run_gui() -> None:
                 skipped = 0
                 lemma_counts: Dict[str, int] = {}
                 
-                with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin, \
-                     self.output_csv_path.open("w", newline="", encoding=self.encoding) as fout:
-                    
+                with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin:
                     reader = csv.DictReader(fin)
                     if reader.fieldnames is None:
                         raise ValueError("Input MLM CSV has no header.")
                     fieldnames = reader.fieldnames
-                    
+
                     if self.lemma_col not in fieldnames:
                         raise ValueError(f"Missing lemma column: {self.lemma_col}")
-                    
+
                     k = self.top_k if self.top_k > 0 else infer_top_k(fieldnames)
                     if k <= 0:
                         raise ValueError("Could not infer top_k; specify --top-k")
-                    
+
                     group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
-                    
+
                     if self.short:
                         out_fieldnames = [self.lemma_col] + group_out_cols
                         if self.include_count:
                             out_fieldnames.append("lemma_count")
                     else:
                         out_fieldnames = list(fieldnames) + group_out_cols
-                    
-                    writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
-                    writer.writeheader()
-                    
-                    for row in reader:
+
+                    is_xlsx = self.output_csv_path.suffix.lower() == ".xlsx"
+
+                    if is_xlsx:
                         try:
-                            lemma = (row.get(self.lemma_col) or "").strip()
-                            if not lemma:
-                                raise ValueError(f"Empty lemma")
-                            
-                            group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
-                            
-                            for i in range(1, k + 1):
-                                tok = row.get(f"token_{i}", "")
-                                p_str = row.get(f"prob_{i}", "")
-                                if not tok or not p_str:
-                                    continue
+                            from openpyxl import Workbook
+                        except ImportError:
+                            raise ValueError(
+                                "XLSX output requested but openpyxl is not installed. Install with: pip install openpyxl"
+                            )
+                        wb = Workbook()
+                        ws = wb.active
+                        ws.title = "Aggregated"
+                        ws.append(out_fieldnames)
+
+                        for row in reader:
+                            try:
+                                lemma = (row.get(self.lemma_col) or "").strip()
+                                if not lemma:
+                                    raise ValueError(f"Empty lemma")
+
+                                group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+                                for i in range(1, k + 1):
+                                    tok = row.get(f"token_{i}", "")
+                                    p_str = row.get(f"prob_{i}", "")
+                                    if not tok or not p_str:
+                                        continue
+                                    try:
+                                        prob = float(p_str)
+                                    except ValueError:
+                                        continue
+
+                                    key = normalize_pred_token(tok)
+                                    gs = lemma_to_groups.get(key)
+                                    if not gs:
+                                        continue
+                                    for g in gs:
+                                        group_sums[g] += prob
+
+                                if self.short:
+                                    out_row = {self.lemma_col: lemma}
+                                    for g in group_labels:
+                                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+                                    if self.include_count:
+                                        lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                        out_row["lemma_count"] = str(lemma_counts[lemma])
+                                else:
+                                    out_row = dict(row)
+                                    for g in group_labels:
+                                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+                                ws.append([out_row.get(col, "") for col in out_fieldnames])
+                                processed += 1
+
+                                if processed % 10000 == 0:
+                                    self.progress_update.emit(f"Processed {processed:,} rows...")
+
+                            except Exception as e:
+                                skipped += 1
+                                if skipped <= 5:
+                                    self.progress_update.emit(f"⚠ Skipping row: {str(e)[:50]}")
+                                continue
+
+                        _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
+                        wb.save(str(self.output_csv_path))
+
+                    else:
+                        with self.output_csv_path.open("w", newline="", encoding=self.encoding) as fout:
+                            writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
+                            writer.writeheader()
+
+                            for row in reader:
                                 try:
-                                    prob = float(p_str)
-                                except ValueError:
+                                    lemma = (row.get(self.lemma_col) or "").strip()
+                                    if not lemma:
+                                        raise ValueError(f"Empty lemma")
+
+                                    group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+                                    for i in range(1, k + 1):
+                                        tok = row.get(f"token_{i}", "")
+                                        p_str = row.get(f"prob_{i}", "")
+                                        if not tok or not p_str:
+                                            continue
+                                        try:
+                                            prob = float(p_str)
+                                        except ValueError:
+                                            continue
+
+                                        key = normalize_pred_token(tok)
+                                        gs = lemma_to_groups.get(key)
+                                        if not gs:
+                                            continue
+                                        for g in gs:
+                                            group_sums[g] += prob
+
+                                    if self.short:
+                                        out_row = {self.lemma_col: lemma}
+                                        for g in group_labels:
+                                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+                                        if self.include_count:
+                                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                            out_row["lemma_count"] = str(lemma_counts[lemma])
+                                    else:
+                                        out_row = dict(row)
+                                        for g in group_labels:
+                                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+                                    writer.writerow(out_row)
+                                    processed += 1
+
+                                    if processed % 10000 == 0:
+                                        self.progress_update.emit(f"Processed {processed:,} rows...")
+
+                                except Exception as e:
+                                    skipped += 1
+                                    if skipped <= 5:
+                                        self.progress_update.emit(f"⚠ Skipping row: {str(e)[:50]}")
                                     continue
-                                
-                                key = normalize_pred_token(tok)
-                                gs = lemma_to_groups.get(key)
-                                if not gs:
-                                    continue
-                                for g in gs:
-                                    group_sums[g] += prob
-                            
-                            if self.short:
-                                out_row = {self.lemma_col: lemma}
-                                for g in group_labels:
-                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                                if self.include_count:
-                                    lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                                    out_row["lemma_count"] = str(lemma_counts[lemma])
-                            else:
-                                out_row = dict(row)
-                                for g in group_labels:
-                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                            
-                            writer.writerow(out_row)
-                            processed += 1
-                            
-                            if processed % 10000 == 0:
-                                self.progress_update.emit(f"Processed {processed:,} rows...")
-                        
-                        except Exception as e:
-                            skipped += 1
-                            if skipped <= 5:
-                                self.progress_update.emit(f"⚠ Skipping row: {str(e)[:50]}")
-                            continue
                 
                 # Save metadata
                 self.progress_update.emit("Computing checksums and saving metadata...")
@@ -546,6 +800,7 @@ def run_gui() -> None:
                     "short": self.short,
                     "include_count": self.include_count,
                     "encoding": self.encoding,
+                    "output_format": "xlsx" if self.output_csv_path.suffix.lower() == ".xlsx" else "csv",
                 }
                 
                 stats = {
@@ -615,9 +870,9 @@ def run_gui() -> None:
             group_layout.addWidget(self.group_browse)
             files_layout.addLayout(group_layout)
             
-            # Output CSV
+            # Output File
             output_layout = QHBoxLayout()
-            output_layout.addWidget(QLabel("Output CSV:"))
+            output_layout.addWidget(QLabel("Output File:"))
             self.output_input = QLineEdit("aggregated_output.csv")
             self.output_browse = QPushButton("Browse...")
             self.output_browse.clicked.connect(self.browse_output)
@@ -709,7 +964,12 @@ def run_gui() -> None:
                 self.group_input.setText(file)
         
         def browse_output(self):
-            file, _ = QFileDialog.getSaveFileName(self, "Select Output CSV", "aggregated_output.csv", "CSV Files (*.csv)")
+            file, _ = QFileDialog.getSaveFileName(
+                self,
+                "Select Output File",
+                "aggregated_output.csv",
+                "CSV or Excel (*.csv *.xlsx)"
+            )
             if file:
                 self.output_input.setText(file)
         
