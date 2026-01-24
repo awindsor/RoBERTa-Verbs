@@ -15,29 +15,60 @@ This workflow enables analyzing verb usage patterns and semantic relationships b
 ### Phase 1: Verb Extraction
 
 #### [SpaCyVerbExtractor.py](SpaCyVerbExtractor.py)
-Extracts verbs from raw text documents using spaCy NLP pipeline.
+Extracts verbs from raw text documents using spaCy NLP pipeline. Supports both CLI and GUI modes with run reconstruction via metadata.
 
 **Features:**
 - Chunked processing with overlapping character windows (prevents sentence boundary loss)
 - Handles multiple input files via CLI or paths file
 - Deduplicates sentences across chunk overlaps
 - Outputs lemma, surface form, character span, and full sentence
+- **NEW:** Generates JSON metadata with MD5 checksums for complete run reconstruction
+- **NEW:** Supports loading previous run settings from JSON metadata
+
+**Output Files:**
+- CSV/TSV file with extracted verbs
+- `.json` metadata file containing:
+  - All extraction settings (model, chunk size, encoding, etc.)
+  - MD5 checksums of input and output files
+  - Extraction statistics (documents, chunks, sentences, verbs)
+  - Timestamp of extraction
 
 **Output Columns:**
 - `doc_path`, `chunk_start_char`, `sent_start_char_in_doc`, `sent_index_in_doc_approx`
 - `token_index_in_sent`, `lemma`, `surface_lower`, `span_in_sentence_char`, `sentence`
 
-**Usage:**
+**Usage (GUI):**
 ```bash
-python SpaCyVerbExtractor.py input.txt -o verbs.csv
-python SpaCyVerbExtractor.py --paths-file paths.txt -o verbs.tsv --tsv --include-aux
-python SpaCyVerbExtractor.py data/*.txt --chunk-size 1000000 --overlap 10000
+python SpaCyVerbExtractor.py
+# In GUI: Load settings from previous run, verify input checksums, configure, and run
 ```
+
+**Usage (CLI):**
+```bash
+# Basic extraction
+python SpaCyVerbExtractor.py input.txt -o verbs.csv
+
+# With options
+python SpaCyVerbExtractor.py --paths-file paths.txt -o verbs.tsv --tsv --include-aux
+
+# Load settings from previous run (CLI options override)
+python SpaCyVerbExtractor.py --load-metadata verbs.json input.txt -o verbs2.csv
+
+# Reconstruct exact run
+python SpaCyVerbExtractor.py --load-metadata verbs.json
+```
+
+**Metadata Features:**
+- **Verification:** CLI and GUI verify input file checksums against saved metadata
+- **Override:** CLI command-line arguments override loaded settings
+- **GUI Changes:** GUI allows changing any settings after loading metadata
+- **Filename:** Metadata JSON has same base name as output (e.g., `verbs.csv` → `verbs.json`)
 
 **Requirements:**
 ```bash
 pip install spacy
 python -m spacy download en_core_web_sm
+pip install PySide6  # GUI mode only
 ```
 
 ---
