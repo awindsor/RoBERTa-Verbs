@@ -566,6 +566,7 @@ def run_gui() -> None:
         """Worker thread for running verb extraction without blocking UI."""
         
         progress_update = Signal(str)
+        progress_bar_update = Signal(int, str)  # (percentage, file_info_text)
         verb_count_update = Signal(int)
         sent_count_update = Signal(int)
         chunk_count_update = Signal(int)
@@ -596,10 +597,107 @@ def run_gui() -> None:
             self.heartbeat_chunks = heartbeat_chunks
             self.use_tsv = use_tsv
             self._stop_requested = False
+            self.total_bytes = 0
+            self.bytes_processed = 0
         
         def request_stop(self):
             """Request graceful stop."""
             self._stop_requested = True
+        
+        def _format_bytes(self, num_bytes: int) -> str:
+            """Format bytes as human-readable string (B, KB, MB, GB)."""
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if num_bytes < 1024.0:
+                    return f"{num_bytes:.1f} {unit}"
+                num_bytes /= 1024.0
+            return f"{num_bytes:.1f} TB"
+        
+        def _process_chunk_batch(self, nlp, chunk_batch, chunk_counter, overall_chunks,
+                                 file_index, file_size_bytes, seen, order, 
+                                 sent_counter, verb_counter, writer, doc_path):
+            """Process a batch of chunks using nlp.pipe() for efficiency."""
+            # Extract texts and metadata from batch
+            chunk_texts = [chunk_text for _, chunk_text in chunk_batch]
+            chunk_starts = [chunk_start for chunk_start, _ in chunk_batch]
+            
+            # Process all chunks in batch using nlp.pipe() (uses multiple cores)
+            for chunk_idx, doc in enumerate(nlp.pipe(chunk_texts)):
+                chunk_start = chunk_starts[chunk_idx]
+                chunk_counter += 1
+                chunk_end = chunk_start + len(chunk_texts[chunk_idx])
+                
+                if file_size_bytes > 0:
+                    pct = min(100.0, (chunk_end / file_size_bytes) * 100.0)
+                else:
+                    pct = 0.0
+                
+                self.progress_update.emit(
+                    f"  Chunk {chunk_counter:6d} | chars {chunk_start:,}–{chunk_end:,} | ~{pct:6.2f}%"
+                )
+                
+                # Update progress bar using chunk position (unaffected by overlaps)
+                bytes_before_this_file = sum(
+                    p.stat().st_size for p in self.paths[:file_index - 1] if p.exists()
+                )
+                bytes_in_this_file = chunk_end
+                self.bytes_processed = bytes_before_this_file + bytes_in_this_file
+                
+                overall_pct = min(100, int((self.bytes_processed / self.total_bytes) * 100))
+                file_info = f"File {file_index} of {len(self.paths)} | {self._format_bytes(self.bytes_processed)} / {self._format_bytes(self.total_bytes)}"
+                self.progress_bar_update.emit(overall_pct, file_info)
+                
+                # Extract verbs from sentences
+                for sent in doc.sents:
+                    sent_start_in_doc = chunk_start + sent.start_char
+                    key = (sent_start_in_doc, sent.text)
+                    
+                    if key in seen:
+                        continue
+                    
+                    seen[key] = sent_counter
+                    order.append(key)
+                    sent_counter += 1
+                    
+                    if len(order) > self.dedupe_window:
+                        drop_n = max(1, self.dedupe_window // 10)
+                        for _ in range(drop_n):
+                            old = order.pop(0)
+                            seen.pop(old, None)
+                    
+                    sent_text = sent.text
+                    
+                    for tok_i, tok in enumerate(sent):
+                        is_verb = tok.pos_ == "VERB" or (self.include_aux and tok.pos_ == "AUX")
+                        if not is_verb:
+                            continue
+                        
+                        verb_counter += 1
+                        
+                        start_in_sent = tok.idx - sent.start_char
+                        end_in_sent = start_in_sent + len(tok.text)
+                        
+                        writer.writerow([
+                            str(doc_path),
+                            chunk_start,
+                            sent_start_in_doc,
+                            seen[key],
+                            tok_i,
+                            tok.lemma_,
+                            tok.text.lower(),
+                            f"{start_in_sent}:{end_in_sent}",
+                            sent_text,
+                        ])
+                
+                if self.heartbeat_chunks > 0 and (chunk_counter % self.heartbeat_chunks == 0):
+                    self.progress_update.emit(
+                        f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs"
+                    )
+                    self.sent_count_update.emit(sent_counter)
+                    self.verb_count_update.emit(verb_counter)
+                
+                self.chunk_count_update.emit(overall_chunks + chunk_idx)
+            
+            return chunk_counter
         
         def run(self):
             """Run the extraction in the worker thread."""
@@ -613,11 +711,24 @@ def run_gui() -> None:
                         nlp.add_pipe("sentencizer")
                 self.progress_update.emit(f"spaCy pipeline: {nlp.pipe_names}")
                 
+                # Calculate total file size for progress tracking
+                self.total_bytes = 0
+                for path in self.paths:
+                    if path.exists():
+                        try:
+                            self.total_bytes += path.stat().st_size
+                        except OSError:
+                            pass
+                
+                if self.total_bytes == 0:
+                    self.total_bytes = 1  # Avoid division by zero
+                
                 delimiter = "\t" if self.use_tsv else ","
                 
                 overall_verbs = 0
                 overall_sents = 0
                 overall_chunks = 0
+                overall_docs = 0
                 
                 with self.output_path.open("w", encoding="utf-8", newline="") as f:
                     writer = csv.writer(f, delimiter=delimiter)
@@ -633,7 +744,7 @@ def run_gui() -> None:
                         "sentence",
                     ])
                     
-                    for doc_path in self.paths:
+                    for file_index, doc_path in enumerate(self.paths, 1):
                         if self._stop_requested:
                             break
                         
@@ -641,7 +752,8 @@ def run_gui() -> None:
                             self.progress_update.emit(f"⚠ Skipping missing path: {doc_path}")
                             continue
                         
-                        self.progress_update.emit(f"Starting document: {doc_path}")
+                        overall_docs += 1
+                        self.progress_update.emit(f"Starting document: {doc_path} ({file_index} of {len(self.paths)})")
                         
                         try:
                             file_size_bytes = doc_path.stat().st_size
@@ -654,6 +766,10 @@ def run_gui() -> None:
                         verb_counter = 0
                         chunk_counter = 0
                         
+                        # Accumulate chunks for batch processing with nlp.pipe()
+                        chunk_batch = []  # List of (chunk_start, chunk_text) tuples
+                        batch_size = 32  # Process chunks in batches for efficiency
+                        
                         for chunk_start, chunk_text in stream_char_chunks(
                             doc_path,
                             encoding=self.encoding,
@@ -664,70 +780,26 @@ def run_gui() -> None:
                             if self._stop_requested:
                                 break
                             
-                            chunk_counter += 1
-                            overall_chunks += 1
-                            chunk_end = chunk_start + len(chunk_text)
+                            chunk_batch.append((chunk_start, chunk_text))
                             
-                            if file_size_bytes > 0:
-                                pct = min(100.0, (chunk_end / file_size_bytes) * 100.0)
-                            else:
-                                pct = 0.0
-                            
-                            self.progress_update.emit(
-                                f"  Chunk {chunk_counter:6d} | chars {chunk_start:,}–{chunk_end:,} | ~{pct:6.2f}%"
-                            )
-                            
-                            doc = nlp(chunk_text)
-                            
-                            for sent in doc.sents:
-                                sent_start_in_doc = chunk_start + sent.start_char
-                                key = (sent_start_in_doc, sent.text)
-                                
-                                if key in seen:
-                                    continue
-                                
-                                seen[key] = sent_counter
-                                order.append(key)
-                                sent_counter += 1
-                                
-                                if len(order) > self.dedupe_window:
-                                    drop_n = max(1, self.dedupe_window // 10)
-                                    for _ in range(drop_n):
-                                        old = order.pop(0)
-                                        seen.pop(old, None)
-                                
-                                sent_text = sent.text
-                                
-                                for tok_i, tok in enumerate(sent):
-                                    is_verb = tok.pos_ == "VERB" or (self.include_aux and tok.pos_ == "AUX")
-                                    if not is_verb:
-                                        continue
-                                    
-                                    verb_counter += 1
-                                    
-                                    start_in_sent = tok.idx - sent.start_char
-                                    end_in_sent = start_in_sent + len(tok.text)
-                                    
-                                    writer.writerow([
-                                        str(doc_path),
-                                        chunk_start,
-                                        sent_start_in_doc,
-                                        seen[key],
-                                        tok_i,
-                                        tok.lemma_,
-                                        tok.text.lower(),
-                                        f"{start_in_sent}:{end_in_sent}",
-                                        sent_text,
-                                    ])
-                            
-                            if self.heartbeat_chunks > 0 and (chunk_counter % self.heartbeat_chunks == 0):
-                                self.progress_update.emit(
-                                    f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs"
+                            # Process batch when it reaches batch_size or at end of file
+                            if len(chunk_batch) >= batch_size:
+                                chunk_counter = self._process_chunk_batch(
+                                    nlp, chunk_batch, chunk_counter, overall_chunks,
+                                    file_index, file_size_bytes, 
+                                    seen, order, sent_counter, verb_counter,
+                                    writer, doc_path
                                 )
-                                self.sent_count_update.emit(sent_counter)
-                                self.verb_count_update.emit(verb_counter)
-                            
-                            self.chunk_count_update.emit(overall_chunks)
+                                chunk_batch = []
+                        
+                        # Process remaining chunks in final batch
+                        if chunk_batch and not self._stop_requested:
+                            chunk_counter = self._process_chunk_batch(
+                                nlp, chunk_batch, chunk_counter, overall_chunks,
+                                file_index, file_size_bytes,
+                                seen, order, sent_counter, verb_counter,
+                                writer, doc_path
+                            )
                         
                         overall_sents += sent_counter
                         overall_verbs += verb_counter
@@ -935,8 +1007,14 @@ def run_gui() -> None:
             progress_layout = QVBoxLayout()
             
             self.progress_bar = QProgressBar()
-            self.progress_bar.setVisible(False)
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(0)
             progress_layout.addWidget(self.progress_bar)
+            
+            self.progress_info_label = QLabel("Ready to start")
+            self.progress_info_label.setStyleSheet("color: #666; font-size: 11px;")
+            progress_layout.addWidget(self.progress_info_label)
             
             self.log_text = QTextEdit()
             self.log_text.setReadOnly(True)
@@ -1091,6 +1169,11 @@ def run_gui() -> None:
                 self.log_text.verticalScrollBar().maximum()
             )
         
+        def update_progress_bar(self, percentage: int, file_info: str):
+            """Update the progress bar and info label."""
+            self.progress_bar.setValue(percentage)
+            self.progress_info_label.setText(file_info)
+        
         def start_extraction(self):
             """Start the extraction process."""
             if not self.input_files:
@@ -1129,8 +1212,10 @@ def run_gui() -> None:
                     # Metadata issues shouldn't block extraction
                     pass
             
-            # Clear log
+            # Clear log and reset progress bar
             self.log_text.clear()
+            self.progress_bar.setValue(0)
+            self.progress_info_label.setText("Processing...")
             self.log("=" * 60)
             self.log("Starting Verb Extraction")
             self.log("=" * 60)
@@ -1159,6 +1244,7 @@ def run_gui() -> None:
             )
             
             self.worker.progress_update.connect(self.log)
+            self.worker.progress_bar_update.connect(self.update_progress_bar)
             self.worker.verb_count_update.connect(lambda v: self.log(f"Verbs: {v:,}"))
             self.worker.sent_count_update.connect(lambda s: self.log(f"Sentences: {s:,}"))
             self.worker.chunk_count_update.connect(lambda c: self.log(f"Chunks: {c:,}"))
@@ -1181,6 +1267,13 @@ def run_gui() -> None:
             self.stop_btn.setEnabled(False)
             self.add_files_btn.setEnabled(True)
             self.add_paths_file_btn.setEnabled(True)
+            
+            # Update progress display
+            if success:
+                self.progress_bar.setValue(100)
+                self.progress_info_label.setText("Complete")
+            else:
+                self.progress_info_label.setText("Error")
             
             self.log("")
             self.log("=" * 60)
