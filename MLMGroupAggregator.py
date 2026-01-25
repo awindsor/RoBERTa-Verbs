@@ -74,8 +74,13 @@ def save_aggregation_metadata(
     stats: Dict[str, any],
     group_labels: List[str],
     lemma_to_groups: Dict[str, Set[str]],
+    source_metadata: Optional[Dict] = None,
 ) -> None:
-    """Save aggregation metadata to JSON file alongside output."""
+    """Save aggregation metadata to JSON file alongside output.
+    
+    Args:
+        source_metadata: Metadata from previous tool (e.g., ROBERTAMaskedLanguageModelVerbs) for chaining
+    """
     json_path = output_path.with_suffix(".json")
     
     # Restructure lemma_to_groups back into the original file format:
@@ -111,6 +116,10 @@ def save_aggregation_metadata(
         },
         "statistics": stats,
     }
+    
+    # Include source metadata for pipeline traceability
+    if source_metadata:
+        metadata["source_metadata"] = source_metadata
     
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -330,6 +339,8 @@ def run_cli() -> None:
     
     # Load metadata if provided
     metadata = None
+    source_metadata = None  # Store the source metadata for chaining
+    
     if args.load_metadata:
         metadata_path = Path(args.load_metadata)
         if not metadata_path.exists():
@@ -337,10 +348,13 @@ def run_cli() -> None:
         
         try:
             metadata = load_aggregation_metadata(metadata_path)
+            # Preserve source metadata if it exists (chaining)
+            source_metadata = metadata.get("source_metadata")
         except (json.JSONDecodeError, KeyError):
-            # Try loading as MLM metadata
+            # Try loading as MLM metadata (from ROBERTAMaskedLanguageModelVerbs)
             try:
                 metadata = load_mlm_metadata(metadata_path)
+                source_metadata = metadata  # Save MLM metadata as source
             except Exception as e:
                 raise SystemExit(f"Failed to load metadata: {e}")
         
@@ -575,6 +589,7 @@ def run_cli() -> None:
         stats,
         group_labels,
         lemma_to_groups,
+        source_metadata,
     )
     
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
@@ -835,6 +850,7 @@ def run_gui() -> None:
                     stats,
                     group_labels,
                     lemma_to_groups,
+                    None,
                 )
                 
                 self.progress_update.emit(f"✓ Written {processed:,} rows ({skipped:,} skipped)")
