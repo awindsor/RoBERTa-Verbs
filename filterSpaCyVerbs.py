@@ -42,7 +42,7 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 # ============================================================================
 # CORE FILTERING LOGIC (shared by CLI and GUI)
@@ -115,7 +115,7 @@ def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
 
 def count_field_freq(path: Path, field: str) -> Counter:
     """Count frequencies of field values."""
-    counts = Counter()
+    counts: Counter = Counter()
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None or field not in reader.fieldnames:
@@ -132,6 +132,13 @@ def in_range(freq: int, min_freq: Optional[int], max_freq: Optional[int]) -> boo
     if max_freq is not None and freq > max_freq:
         return False
     return True
+
+
+def count_input_rows(input_path: Path) -> int:
+    """Count total data rows in input CSV (excluding header)."""
+    with input_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return sum(1 for _ in reader)
 
 
 def filter_rows(
@@ -234,7 +241,10 @@ def run_cli() -> None:
     print(f"Counting frequencies for field '{args.field}'...")
     counts = count_field_freq(input_path, args.field)
     
-    print(f"Filtering and writing output...")
+    print("Counting input rows...")
+    total_input_rows = count_input_rows(input_path)
+    
+    print("Filtering and writing output...")
     rows_written = filter_rows(
         input_path,
         output_path,
@@ -243,6 +253,8 @@ def run_cli() -> None:
         args.min_freq,
         args.max_freq,
     )
+    
+    rows_filtered = total_input_rows - rows_written
     
     # Compute checksums and save metadata
     input_checksum = compute_file_md5(input_path)
@@ -256,12 +268,15 @@ def run_cli() -> None:
     
     stats = {
         "rows_written": rows_written,
+        "rows_filtered_out": rows_filtered,
+        "total_input_rows": total_input_rows,
         "unique_values": len(counts),
     }
     
     save_filter_metadata(output_path, input_path, input_checksum, output_checksum, filter_args, stats)
     
     print(f"✓ Wrote {rows_written} rows to {output_path}")
+    print(f"✓ Filtered out {rows_filtered} rows")
     print(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
 
 
@@ -272,7 +287,7 @@ def run_cli() -> None:
 def run_gui() -> None:
     """Launch the GUI application."""
     try:
-        from PySide6.QtCore import Qt, QThread, Signal, QSize
+        from PySide6.QtCore import QThread, Signal, QSize
         from PySide6.QtWidgets import (
             QApplication,
             QMainWindow,
@@ -291,8 +306,8 @@ def run_gui() -> None:
         )
     except ImportError:
         print("Error: PySide6 is required for GUI mode.")
-        print("Install it with: pip install PySide6")
-        print("\nOr run in CLI mode by providing arguments. Use --help for usage.")
+        print("Install it with: pip install PySide6\n")
+        print("Or run in CLI mode by providing arguments. Use --help for usage.")
         sys.exit(1)
 
     class FilterWorker(QThread):
@@ -329,7 +344,11 @@ def run_gui() -> None:
                 counts = count_field_freq(self.input_path, self.field)
                 
                 self.progress_update.emit(f"Found {len(counts)} unique values")
-                self.progress_update.emit(f"Filtering and writing output...")
+                self.progress_update.emit("Counting input rows...")
+                total_input_rows = count_input_rows(self.input_path)
+                self.progress_update.emit(f"Total input rows: {total_input_rows}")
+                
+                self.progress_update.emit("Filtering and writing output...")
                 
                 rows_written = filter_rows(
                     self.input_path,
@@ -340,7 +359,9 @@ def run_gui() -> None:
                     self.max_freq,
                 )
                 
-                self.progress_update.emit(f"Writing metadata...")
+                rows_filtered = total_input_rows - rows_written
+                
+                self.progress_update.emit("Writing metadata...")
                 input_checksum = compute_file_md5(self.input_path)
                 output_checksum = compute_file_md5(self.output_path)
                 
@@ -352,12 +373,15 @@ def run_gui() -> None:
                 
                 stats = {
                     "rows_written": rows_written,
+                    "rows_filtered_out": rows_filtered,
+                    "total_input_rows": total_input_rows,
                     "unique_values": len(counts),
                 }
                 
                 save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats)
                 
                 self.progress_update.emit(f"✓ Wrote {rows_written} rows")
+                self.progress_update.emit(f"✓ Filtered out {rows_filtered} rows")
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")
                 self.finished.emit(True, f"Filtering complete. Output: {self.output_path}")
                 
@@ -600,7 +624,7 @@ def run_gui() -> None:
                         reply = QMessageBox.warning(self, "Checksum Mismatch", msg, QMessageBox.Yes | QMessageBox.No)
                         if reply == QMessageBox.No:
                             return
-                except:
+                except Exception:
                     pass
             
             # Clear log

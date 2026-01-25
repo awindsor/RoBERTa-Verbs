@@ -465,6 +465,7 @@ def run_cli() -> None:
         "total_chunks": overall_chunks,
         "total_sentences": overall_sents,
         "total_verbs": overall_verbs,
+        "output_rows": overall_verbs,
         "elapsed_seconds": elapsed_all,
     }
     
@@ -705,6 +706,7 @@ def run_gui() -> None:
                     "total_chunks": overall_chunks,
                     "total_sentences": overall_sents,
                     "total_verbs": overall_verbs,
+                    "output_rows": overall_verbs,
                 }
                 
                 save_run_metadata(self.output_path, self.paths, input_checksums, output_checksum, metadata_args, stats)
