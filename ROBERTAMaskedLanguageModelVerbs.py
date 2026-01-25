@@ -28,12 +28,12 @@ Requirements:
   pip install PySide6  # for GUI mode only
 
 CLI Examples:
-  python ROBERTAMaskedLanguageModelVerbs.py verbs.csv output.csv --model roberta-base --batch-size 16 --top-k 10
-  python ROBERTAMaskedLanguageModelVerbs.py verbs.csv output.csv --device cuda --top-k 20
-  python ROBERTAMaskedLanguageModelVerbs.py --load-metadata output.json verbs.csv output2.csv
+  python RoBERTaMaskedLanguageModelVerbs.py verbs.csv output.csv --model roberta-base --batch-size 16 --top-k 10
+  python RoBERTaMaskedLanguageModelVerbs.py verbs.csv output.csv --device cuda --top-k 20
+  python RoBERTaMaskedLanguageModelVerbs.py --load-metadata output.json verbs.csv output2.csv
 
 GUI Mode:
-  python ROBERTAMaskedLanguageModelVerbs.py
+  python RoBERTaMaskedLanguageModelVerbs.py
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def save_mlm_metadata(
     
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "tool": "ROBERTAMaskedLanguageModelVerbs",
+        "tool": "RoBERTaMaskedLanguageModelVerbs",
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),
@@ -246,12 +246,16 @@ def run_cli() -> None:
         metadata = load_mlm_metadata(metadata_path)
         tool_name = metadata.get("tool", "unknown")
         
-        # Check if this is a SpaCyVerbExtractor JSON (look for output_file in metadata)
-        if "output_file" in metadata and metadata.get("tool") == "SpaCyVerbExtractor":
-            # This is SpaCyVerbExtractor output - use its output as our input
+        # Check if this is a SpaCyVerbExtractor or FilterSpaCyVerbs JSON
+        if tool_name == "SpaCyVerbExtractor":
+            # SpaCyVerbExtractor output - use its output as our input
             source_metadata = metadata  # Save for chaining
             args.input_csv = args.input_csv or metadata.get("output_file")
-        elif "output_file" in metadata and metadata.get("tool") == "ROBERTAMaskedLanguageModelVerbs":
+        elif tool_name == "FilterSpaCyVerbs":
+            # FilterSpaCyVerbs output - use its output as our input
+            source_metadata = metadata  # Save for chaining
+            args.input_csv = args.input_csv or metadata.get("output_file")
+        elif tool_name == "RoBERTaMaskedLanguageModelVerbs":
             # This is existing MLM metadata - use its input
             source_metadata = metadata.get("source_metadata")  # Preserve chain
             args.input_csv = args.input_csv or metadata.get("input_file")
@@ -849,7 +853,7 @@ def run_gui() -> None:
                 tool = metadata.get("tool", "unknown")
                 settings = metadata.get("settings", {})
                 
-                if tool == "ROBERTAMaskedLanguageModelVerbs":
+                if tool == "RoBERTaMaskedLanguageModelVerbs":
                     self.input_text.setText(metadata.get("input_file", ""))
                     self.output_text.setText(metadata.get("output_file", ""))
                     self.model_combo.setCurrentText(settings.get("model", "roberta-base"))
@@ -865,8 +869,8 @@ def run_gui() -> None:
                         self.device_combo.setCurrentText("cpu")
                     else:
                         self.device_combo.setCurrentText("auto")
-                elif tool == "SpaCyVerbExtractor":
-                    # Use extractor output as input and default output in same folder
+                elif tool == "SpaCyVerbExtractor" or tool == "FilterSpaCyVerbs":
+                    # Use extractor/filter output as input and default output in same folder
                     input_csv = metadata.get("output_file", "")
                     self.input_text.setText(input_csv)
                     if input_csv:
@@ -877,7 +881,7 @@ def run_gui() -> None:
                     QMessageBox.warning(
                         self,
                         "Unknown Metadata Type",
-                        f"This metadata is from '{tool}'. Expected ROBERTAMaskedLanguageModelVerbs or SpaCyVerbExtractor."
+                        f"This metadata is from '{tool}'. Expected RoBERTaMaskedLanguageModelVerbs, SpaCyVerbExtractor, or FilterSpaCyVerbs."
                     )
                     return
                 
