@@ -847,32 +847,41 @@ def run_gui() -> None:
                 
                 # Check tool type
                 tool = metadata.get("tool", "unknown")
-                if tool != "ROBERTAMaskedLanguageModelVerbs":
+                settings = metadata.get("settings", {})
+                
+                if tool == "ROBERTAMaskedLanguageModelVerbs":
+                    self.input_text.setText(metadata.get("input_file", ""))
+                    self.output_text.setText(metadata.get("output_file", ""))
+                    self.model_combo.setCurrentText(settings.get("model", "roberta-base"))
+                    self.batch_spin.setValue(settings.get("batch_size", 16))
+                    self.topk_spin.setValue(settings.get("top_k", 10))
+                    
+                    device = settings.get("device", "auto")
+                    if "cuda" in str(device).lower():
+                        self.device_combo.setCurrentText("cuda")
+                    elif "mps" in str(device).lower():
+                        self.device_combo.setCurrentText("mps")
+                    elif "cpu" in str(device).lower():
+                        self.device_combo.setCurrentText("cpu")
+                    else:
+                        self.device_combo.setCurrentText("auto")
+                elif tool == "SpaCyVerbExtractor":
+                    # Use extractor output as input and default output in same folder
+                    input_csv = metadata.get("output_file", "")
+                    self.input_text.setText(input_csv)
+                    if input_csv:
+                        in_path = Path(input_csv)
+                        default_out = in_path.with_name(f"{in_path.stem}.mlm.csv")
+                        self.output_text.setText(str(default_out))
+                else:
                     QMessageBox.warning(
                         self,
-                        "Wrong Metadata Type",
-                        f"This metadata is from '{tool}', not ROBERTAMaskedLanguageModelVerbs"
+                        "Unknown Metadata Type",
+                        f"This metadata is from '{tool}'. Expected ROBERTAMaskedLanguageModelVerbs or SpaCyVerbExtractor."
                     )
                     return
                 
-                settings = metadata.get("settings", {})
-                self.input_text.setText(metadata.get("input_file", ""))
-                self.output_text.setText(metadata.get("output_file", ""))
-                self.model_combo.setCurrentText(settings.get("model", "roberta-base"))
-                self.batch_spin.setValue(settings.get("batch_size", 16))
-                self.topk_spin.setValue(settings.get("top_k", 10))
-                
-                device = settings.get("device", "auto")
-                if "cuda" in str(device).lower():
-                    self.device_combo.setCurrentText("cuda")
-                elif "mps" in str(device).lower():
-                    self.device_combo.setCurrentText("mps")
-                elif "cpu" in str(device).lower():
-                    self.device_combo.setCurrentText("cpu")
-                else:
-                    self.device_combo.setCurrentText("auto")
-                
-                # Verify checksum
+                # Verify checksum when input is set
                 if self.input_text.text():
                     matches, message = verify_input_checksum(Path(self.input_text.text()), metadata)
                     self.log(message)
