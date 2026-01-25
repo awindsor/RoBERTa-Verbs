@@ -175,6 +175,59 @@ def stream_char_chunks(
             start_char += len(block)
 
 
+def load_spacy_model(model_name: str, logger=None):
+    """
+    Load a spaCy model, downloading it if necessary.
+    
+    Args:
+        model_name: Name of the spaCy model (e.g., 'en_core_web_sm')
+        logger: Optional logger for informational messages
+    
+    Returns:
+        The loaded spaCy model
+    
+    Raises:
+        OSError: If model download fails
+    """
+    import subprocess
+    
+    try:
+        # Try to load the model directly
+        if logger:
+            logger.info(f"Loading spaCy model: {model_name}")
+        nlp = spacy.load(model_name)
+        return nlp
+    except OSError as e:
+        # Model not found, try to download it
+        if "Can't find model" in str(e) or "No such file or directory" in str(e):
+            if logger:
+                logger.info(f"Model '{model_name}' not found locally. Downloading...")
+            
+            # Download the model
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "spacy", "download", model_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                if result.returncode != 0:
+                    raise OSError(f"Failed to download model '{model_name}': {result.stderr}")
+                
+                if logger:
+                    logger.info(f"Downloaded model '{model_name}'")
+                
+                # Try to load again
+                nlp = spacy.load(model_name)
+                return nlp
+            except subprocess.TimeoutExpired:
+                raise OSError(f"Timeout downloading model '{model_name}'")
+        else:
+            # Some other error
+            raise
+
+
 def iter_paths(cli_paths: List[str], paths_file: Optional[str]) -> List[Path]:
     """Parse input paths from CLI arguments and/or paths file."""
     paths: List[Path] = [Path(p) for p in cli_paths]
@@ -303,8 +356,8 @@ def run_cli() -> None:
 
     # Load spaCy with only what we need.
     t0 = time.time()
-    logger.info(f"Loading spaCy model: {args.model}")
-    nlp = spacy.load(args.model, disable=["ner", "textcat"])
+    nlp = load_spacy_model(args.model, logger)
+    nlp.select_pipes(disable=["ner", "textcat"])
     if "parser" not in nlp.pipe_names:
         if "sentencizer" not in nlp.pipe_names:
             nlp.add_pipe("sentencizer")
@@ -551,9 +604,10 @@ def run_gui() -> None:
         def run(self):
             """Run the extraction in the worker thread."""
             try:
-                # Load spaCy model
+                # Load spaCy model (with auto-download if needed)
                 self.progress_update.emit(f"Loading spaCy model: {self.model}")
-                nlp = spacy.load(self.model, disable=["ner", "textcat"])
+                nlp = load_spacy_model(self.model, logger=None)
+                nlp.select_pipes(disable=["ner", "textcat"])
                 if "parser" not in nlp.pipe_names:
                     if "sentencizer" not in nlp.pipe_names:
                         nlp.add_pipe("sentencizer")
@@ -794,6 +848,7 @@ def run_gui() -> None:
                 "en_core_web_sm",
                 "en_core_web_md",
                 "en_core_web_lg",
+                "en_core_web_trf",
             ])
             model_layout.addWidget(model_label)
             model_layout.addWidget(self.model_combo)
