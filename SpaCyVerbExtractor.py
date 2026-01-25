@@ -79,6 +79,7 @@ def save_run_metadata(
     
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
+        "tool": "SpaCyVerbExtractor",
         "status": status,
         "output_file": str(output_path),
         "output_checksum": output_checksum,

@@ -346,17 +346,27 @@ def run_cli() -> None:
         if not metadata_path.exists():
             raise SystemExit(f"Metadata file not found: {metadata_path}")
         
-        try:
-            metadata = load_aggregation_metadata(metadata_path)
+        with metadata_path.open("r", encoding="utf-8") as f:
+            try:
+                raw_metadata = json.load(f)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"Failed to parse JSON metadata: {e}")
+        
+        # Detect what type of metadata this is
+        tool_name = raw_metadata.get("tool", "unknown")
+        logger.info(f"This metadata is from '{tool_name}'")
+        
+        if tool_name == "MLMGroupAggregator":
+            metadata = raw_metadata
             # Preserve source metadata if it exists (chaining)
             source_metadata = metadata.get("source_metadata")
-        except (json.JSONDecodeError, KeyError):
-            # Try loading as MLM metadata (from ROBERTAMaskedLanguageModelVerbs)
-            try:
-                metadata = load_mlm_metadata(metadata_path)
-                source_metadata = metadata  # Save MLM metadata as source
-            except Exception as e:
-                raise SystemExit(f"Failed to load metadata: {e}")
+        elif tool_name == "ROBERTAMaskedLanguageModelVerbs":
+            metadata = raw_metadata
+            source_metadata = metadata.get("source_metadata")
+        else:
+            # Unknown tool - just use what we loaded
+            metadata = raw_metadata
+            source_metadata = metadata.get("source_metadata")
         
         # Use loaded settings as defaults, CLI args override
         if metadata.get("tool") == "MLMGroupAggregator":

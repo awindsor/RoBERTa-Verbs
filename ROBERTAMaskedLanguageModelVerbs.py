@@ -74,8 +74,13 @@ def save_mlm_metadata(
     output_checksum: str,
     settings: Dict,
     stats: Dict,
+    source_metadata: Optional[Dict] = None,
 ) -> None:
-    """Save MLM inference metadata to JSON file alongside output."""
+    """Save MLM inference metadata to JSON file alongside output.
+    
+    Args:
+        source_metadata: Metadata from previous tool (e.g., SpaCyVerbExtractor) for chaining
+    """
     json_path = output_path.with_suffix(".json")
     
     metadata = {
@@ -88,6 +93,10 @@ def save_mlm_metadata(
         "settings": settings,
         "statistics": stats,
     }
+    
+    # Include source metadata for pipeline traceability
+    if source_metadata:
+        metadata["source_metadata"] = source_metadata
     
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -227,12 +236,29 @@ def run_cli() -> None:
 
     # Load metadata if provided
     metadata = None
+    source_metadata = None  # Store the source metadata for chaining
+    
     if args.load_metadata:
         metadata_path = Path(args.load_metadata)
         if not metadata_path.exists():
             raise SystemExit(f"Metadata file not found: {metadata_path}")
         
         metadata = load_mlm_metadata(metadata_path)
+        tool_name = metadata.get("tool", "unknown")
+        
+        # Check if this is a SpaCyVerbExtractor JSON (look for output_file in metadata)
+        if "output_file" in metadata and metadata.get("tool") == "SpaCyVerbExtractor":
+            # This is SpaCyVerbExtractor output - use its output as our input
+            source_metadata = metadata  # Save for chaining
+            args.input_csv = args.input_csv or metadata.get("output_file")
+        elif "output_file" in metadata and metadata.get("tool") == "ROBERTAMaskedLanguageModelVerbs":
+            # This is existing MLM metadata - use its input
+            source_metadata = metadata.get("source_metadata")  # Preserve chain
+            args.input_csv = args.input_csv or metadata.get("input_file")
+        else:
+            # Generic metadata - use input_file if available
+            if "input_file" in metadata:
+                args.input_csv = args.input_csv or metadata.get("input_file")
         
         # Use loaded settings as defaults, CLI args override
         if not args.model or args.model == "roberta-base":
@@ -259,6 +285,11 @@ def run_cli() -> None:
         datefmt="%H:%M:%S",
     )
     logger = logging.getLogger("mlm")
+    
+    # Log metadata source if loaded
+    if metadata:
+        tool_name = metadata.get("tool", "unknown")
+        logger.info(f"This metadata is from '{tool_name}'")
 
     if args.top_k <= 0:
         raise SystemExit("--top-k must be a positive integer.")
@@ -426,7 +457,7 @@ def run_cli() -> None:
         "elapsed_seconds": round(elapsed_time, 2),
     }
     
-    save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats)
+    save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata)
 
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} time={elapsed_time:.1f}s output={args.output_csv}")
     logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
@@ -613,7 +644,7 @@ def run_gui() -> None:
                     "elapsed_seconds": round(elapsed_time, 2),
                 }
                 
-                save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats)
+                save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None)
                 
                 self.progress_update.emit(f"✓ Written {processed:,} rows in {elapsed_time:.1f}s")
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")
