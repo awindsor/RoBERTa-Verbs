@@ -64,13 +64,18 @@ def save_filter_metadata(
     output_checksum: str,
     args: Dict,
     stats: Dict,
+    source_metadata: Optional[Dict] = None,
 ) -> None:
-    """Save filtering metadata to JSON file alongside output."""
+    """Save filtering metadata to JSON file alongside output.
+    
+    Args:
+        source_metadata: Input metadata (e.g., from SpaCyVerbExtractor) for chaining
+    """
     json_path = output_path.with_suffix(".json")
     
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "tool": "filterSpaCyVerbs",
+        "tool": "FilterSpaCyVerbs",
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),
@@ -82,6 +87,10 @@ def save_filter_metadata(
         },
         "statistics": stats,
     }
+    
+    # Include source metadata for pipeline chaining
+    if source_metadata:
+        metadata["source_metadata"] = source_metadata
     
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -184,16 +193,35 @@ def run_cli() -> None:
     ap.add_argument("--min-freq", type=int, help="Keep values with freq >= min_freq")
     ap.add_argument("--max-freq", type=int, help="Keep values with freq <= max_freq")
     ap.add_argument("--load-metadata", help="Load settings from metadata JSON (CLI args override)")
+    ap.add_argument("--strict-checksum", action="store_true", help="Abort if input file checksum mismatches metadata (CLI only)")
     args = ap.parse_args()
 
     # Load metadata if provided
     metadata = None
+    source_metadata = None
     if args.load_metadata:
         metadata_path = Path(args.load_metadata)
         if not metadata_path.exists():
             raise SystemExit(f"Metadata file not found: {metadata_path}")
         
         metadata = load_filter_metadata(metadata_path)
+        tool_name = metadata.get("tool", "unknown")
+        
+        # Handle SpaCyVerbExtractor metadata - use its output as input
+        if tool_name == "SpaCyVerbExtractor":
+            source_metadata = metadata
+            if not args.input_csv:
+                args.input_csv = metadata.get("output_file")
+        # Handle FilterSpaCyVerbs metadata
+        elif tool_name == "FilterSpaCyVerbs":
+            source_metadata = metadata.get("source_metadata")
+            if not args.input_csv:
+                args.input_csv = metadata.get("input_file")
+        else:
+            # Unknown or legacy filterSpaCyVerbs tool
+            source_metadata = metadata.get("source_metadata")
+            if not args.input_csv:
+                args.input_csv = metadata.get("input_file")
         
         # Use loaded settings as defaults, CLI args override
         if not args.field:
@@ -202,10 +230,6 @@ def run_cli() -> None:
             args.min_freq = metadata.get("settings", {}).get("min_freq")
         if args.max_freq is None:
             args.max_freq = metadata.get("settings", {}).get("max_freq")
-        
-        # If input not provided on CLI, use from metadata
-        if not args.input_csv:
-            args.input_csv = metadata.get("input_file")
     
     # Validate required arguments
     if not args.input_csv or not args.output_csv:
@@ -233,9 +257,37 @@ def run_cli() -> None:
     
     # Verify checksum if metadata was loaded
     if metadata:
+        # Default verification using filter metadata schema
         matches, message = verify_input_checksum(input_path, metadata)
         if not matches:
-            print(f"⚠ {message}")
+            if args.strict_checksum:
+                raise SystemExit(f"Checksum mismatch: {message}")
+            else:
+                print(f"⚠ {message}")
+
+        # If metadata is from SpaCyVerbExtractor and our input is its output,
+        # verify against the extractor's output checksum (fallback schema)
+        tool_name = metadata.get("tool", "unknown")
+        if tool_name == "SpaCyVerbExtractor" and metadata.get("output_file"):
+            try:
+                spaCy_output = Path(metadata.get("output_file"))
+                # Only check if the current input matches the referenced output file
+                if input_path.resolve() == spaCy_output.resolve():
+                    expected_out_checksum = metadata.get("output_checksum")
+                    if expected_out_checksum:
+                        actual_in_checksum = compute_file_md5(input_path)
+                        if actual_in_checksum != expected_out_checksum:
+                            msg = (
+                                "Input file has changed (checksum mismatch vs SpaCy output): "
+                                f"{input_path}"
+                            )
+                            if args.strict_checksum:
+                                raise SystemExit(f"Checksum mismatch: {msg}")
+                            else:
+                                print(f"⚠ {msg}")
+            except Exception:
+                # Non-fatal: if anything goes wrong, skip spaCy-specific check
+                pass
     
     # Filter
     print(f"Counting frequencies for field '{args.field}'...")
@@ -273,7 +325,7 @@ def run_cli() -> None:
         "unique_values": len(counts),
     }
     
-    save_filter_metadata(output_path, input_path, input_checksum, output_checksum, filter_args, stats)
+    save_filter_metadata(output_path, input_path, input_checksum, output_checksum, filter_args, stats, source_metadata)
     
     print(f"✓ Wrote {rows_written} rows to {output_path}")
     print(f"✓ Filtered out {rows_filtered} rows")
@@ -324,6 +376,7 @@ def run_gui() -> None:
             field: str,
             min_freq: Optional[int],
             max_freq: Optional[int],
+            source_metadata: Optional[Dict] = None,
         ):
             super().__init__()
             self.input_path = input_path
@@ -331,6 +384,7 @@ def run_gui() -> None:
             self.field = field
             self.min_freq = min_freq
             self.max_freq = max_freq
+            self.source_metadata = source_metadata
             self._stop_requested = False
         
         def request_stop(self):
@@ -378,7 +432,7 @@ def run_gui() -> None:
                     "unique_values": len(counts),
                 }
                 
-                save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats)
+                save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats, self.source_metadata)
                 
                 self.progress_update.emit(f"✓ Wrote {rows_written} rows")
                 self.progress_update.emit(f"✓ Filtered out {rows_filtered} rows")
@@ -398,6 +452,7 @@ def run_gui() -> None:
             self.setMinimumSize(QSize(900, 600))
             
             self.worker: Optional[FilterWorker] = None
+            self.source_metadata: Optional[Dict] = None
             
             self.init_ui()
         
@@ -558,7 +613,7 @@ def run_gui() -> None:
                 # Handle both filterSpaCyVerbs and SpaCyVerbExtractor metadata
                 tool = metadata.get("tool", "unknown")
                 
-                if tool == "filterSpaCyVerbs":
+                if tool == "FilterSpaCyVerbs":
                     # Filter metadata
                     settings = metadata.get("settings", {})
                     self.input_text.setText(metadata.get("input_file", ""))
@@ -566,11 +621,14 @@ def run_gui() -> None:
                     self.field_combo.setCurrentText(settings.get("field", "lemma"))
                     self.min_spin.setValue(settings.get("min_freq") or 1)
                     self.max_spin.setValue(settings.get("max_freq") or 0)
+                    # Preserve source metadata for chaining
+                    self.source_metadata = metadata.get("source_metadata")
                     self.log(f"✓ Loaded filter settings from: {json_path}")
                 
                 elif tool == "SpaCyVerbExtractor" or metadata.get("output_file", "").endswith(".csv"):
-                    # Extractor metadata - use as input
+                    # Extractor metadata - use as input and store as source
                     self.input_text.setText(metadata.get("output_file", ""))
+                    self.source_metadata = metadata
                     
                     # Verify checksum
                     matches, message = verify_input_checksum(Path(self.input_text.text()), metadata)
@@ -652,6 +710,7 @@ def run_gui() -> None:
                 self.field_combo.currentText(),
                 self.min_spin.value() if self.min_spin.value() > 0 else None,
                 self.max_spin.value() if self.max_spin.value() > 0 else None,
+                self.source_metadata,
             )
             
             self.worker.progress_update.connect(self.log)
