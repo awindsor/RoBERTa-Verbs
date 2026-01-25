@@ -76,6 +76,7 @@ def save_filter_metadata(
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "FilterSpaCyVerbs",
+        "versions": get_version_info(),
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),
@@ -206,6 +207,11 @@ def run_cli() -> None:
         
         metadata = load_filter_metadata(metadata_path)
         tool_name = metadata.get("tool", "unknown")
+        
+        # Check version compatibility
+        version_warning = check_version_compatibility(metadata)
+        if version_warning:
+            print(version_warning)
         
         # Handle SpaCyVerbExtractor metadata - use its output as input
         if tool_name == "SpaCyVerbExtractor":

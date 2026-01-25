@@ -86,6 +86,7 @@ def save_mlm_metadata(
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "RoBERTaMaskedLanguageModelVerbs",
+        "versions": get_mlm_version_info(model_name),
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),

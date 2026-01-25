@@ -7,10 +7,10 @@ Supports both CLI and GUI modes:
   - Run with arguments: uses CLI mode
 
 Use-case:
-  - You already ran ROBERTAMaskedLanguageModelVerbs.py and have a CSV with token_i/prob_i
+  - You already ran RoBERTaMaskedLanguageModelVerbs.py and have a CSV with token_i/prob_i
   - You have a grouping CSV (columns=groups, cells=lemmas; header row=group names)
   - You want to compute per-row group probabilities by summing probs of tokens in each group
-  - Can load settings from ROBERTAMaskedLanguageModelVerbs.json or MLMGroupAggregator.json
+  - Can load settings from RoBERTaMaskedLanguageModelVerbs.json or MLMGroupAggregator.json
 
 Output modes:
   1) Default: write ALL original columns + appended group columns
@@ -79,7 +79,7 @@ def save_aggregation_metadata(
     """Save aggregation metadata to JSON file alongside output.
     
     Args:
-        source_metadata: Metadata from previous tool (e.g., ROBERTAMaskedLanguageModelVerbs) for chaining
+        source_metadata: Metadata from previous tool (e.g., RoBERTaMaskedLanguageModelVerbs) for chaining
     """
     json_path = output_path.with_suffix(".json")
     
@@ -96,6 +96,7 @@ def save_aggregation_metadata(
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "MLMGroupAggregator",
+        "versions": get_aggregator_version_info(),
         "output_file": str(output_path),
         "output_checksum": output_checksum,
         "input_files": {
@@ -132,7 +133,7 @@ def load_aggregation_metadata(json_path: Path) -> Dict:
 
 
 def load_mlm_metadata(json_path: Path) -> Dict:
-    """Load MLM metadata from ROBERTAMaskedLanguageModelVerbs JSON."""
+    """Load MLM metadata from RoBERTaMaskedLanguageModelVerbs JSON."""
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -326,7 +327,7 @@ def run_cli() -> None:
     ap.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     ap.add_argument(
         "--load-metadata",
-        help="Load settings from metadata JSON (MLMGroupAggregator.json or ROBERTAMaskedLanguageModelVerbs.json)"
+        help="Load settings from metadata JSON (MLMGroupAggregator.json or RoBERTaMaskedLanguageModelVerbs.json)"
     )
     args = ap.parse_args()
     
@@ -359,11 +360,14 @@ def run_cli() -> None:
         metadata = raw_metadata
         source_metadata = metadata.get("source_metadata")
         
+        # Check version compatibility
+        check_aggregator_version_compatibility(metadata, logger)
+        
         # Extract and apply settings from loaded metadata
         settings = metadata.get("settings", {})
         
         # Apply settings based on tool type
-        if tool_name in ["MLMGroupAggregator", "ROBERTAMaskedLanguageModelVerbs"]:
+        if tool_name in ["MLMGroupAggregator", "RoBERTaMaskedLanguageModelVerbs"]:
             if not args.top_k or args.top_k <= 0:
                 args.top_k = settings.get("top_k", 0)
             if args.lemma_col == "lemma":
@@ -374,7 +378,7 @@ def run_cli() -> None:
                 args.include_count = settings.get("include_count", False)
         
         # Infer input CSV path based on tool type
-        if tool_name == "ROBERTAMaskedLanguageModelVerbs" and args.mlm_csv is None:
+        if tool_name == "RoBERTaMaskedLanguageModelVerbs" and args.mlm_csv is None:
             args.mlm_csv = metadata.get("output_file")
         elif tool_name == "SpaCyVerbExtractor" and args.mlm_csv is None:
             # Use SpaCyVerbExtractor output as MLM CSV input
@@ -1025,8 +1029,8 @@ def run_gui() -> None:
                 settings = metadata.get("settings", {})
                 input_files = metadata.get("input_files", {})
                 
-                # Handle ROBERTAMaskedLanguageModelVerbs metadata
-                if tool == "ROBERTAMaskedLanguageModelVerbs":
+                # Handle RoBERTaMaskedLanguageModelVerbs metadata
+                if tool == "RoBERTaMaskedLanguageModelVerbs":
                     if input_files.get("mlm_csv"):
                         self.mlm_input.setText(input_files["mlm_csv"])
                     # User must provide group CSV
@@ -1049,7 +1053,7 @@ def run_gui() -> None:
                     self.mlm_input.setText(metadata.get("output_file", ""))
                     # User must provide group CSV
                 else:
-                    QMessageBox.warning(self, "Unknown Metadata", f"This metadata is from '{tool}'.\nExpected ROBERTAMaskedLanguageModelVerbs, MLMGroupAggregator, or SpaCyVerbExtractor.")
+                    QMessageBox.warning(self, "Unknown Metadata", f"This metadata is from '{tool}'.\nExpected RoBERTaMaskedLanguageModelVerbs, MLMGroupAggregator, or SpaCyVerbExtractor.")
                     return
                 
                 self.log(f"✓ Loaded settings from: {json_path}")

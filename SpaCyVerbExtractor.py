@@ -49,6 +49,33 @@ import spacy
 
 
 # ============================================================================
+# VERSION TRACKING
+# ============================================================================
+
+def get_spacy_version_info() -> Dict:
+    """Get spacy and model version information."""
+    import spacy
+    return {
+        "spacy": spacy.__version__,
+    }
+
+
+def check_version_compatibility(metadata: Dict, logger) -> None:
+    """Check if current spacy version matches metadata and warn if different."""
+    if "versions" not in metadata:
+        return
+    
+    meta_versions = metadata.get("versions", {})
+    current_versions = get_spacy_version_info()
+    
+    if meta_versions.get("spacy") != current_versions.get("spacy"):
+        logger.warning(
+            f"spacy version mismatch: metadata has {meta_versions.get('spacy')}, "
+            f"current is {current_versions.get('spacy')}"
+        )
+
+
+# ============================================================================
 # CORE EXTRACTION LOGIC (shared by CLI and GUI)
 # ============================================================================
 
@@ -80,6 +107,7 @@ def save_run_metadata(
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "SpaCyVerbExtractor",
+        "versions": get_spacy_version_info(),
         "status": status,
         "output_file": str(output_path),
         "output_checksum": output_checksum,
