@@ -39,7 +39,8 @@ with (
 ):
     reader = csv.DictReader(f, delimiter="\t")
     print(reader.fieldnames)
-    headers = reader.fieldnames + ["inflected_form"]
+    fieldnames = list(reader.fieldnames) if reader.fieldnames is not None else []
+    headers = fieldnames + ["inflected_form"]
     writer = csv.DictWriter(out_f, fieldnames=headers)
     for row in reader:
         lemma = row["lemma"]
