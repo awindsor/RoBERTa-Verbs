@@ -72,9 +72,21 @@ def save_aggregation_metadata(
     output_checksum: str,
     settings: Dict[str, any],
     stats: Dict[str, any],
+    group_labels: List[str],
+    lemma_to_groups: Dict[str, Set[str]],
 ) -> None:
     """Save aggregation metadata to JSON file alongside output."""
     json_path = output_path.with_suffix(".json")
+    
+    # Restructure lemma_to_groups back into the original file format:
+    # groups as keys, lemmas as sorted lists (matching the input CSV structure)
+    groups_structure = {}
+    for group_name in group_labels:
+        lemmas_in_group = sorted([
+            lemma for lemma, groups in lemma_to_groups.items()
+            if group_name in groups
+        ])
+        groups_structure[group_name] = lemmas_in_group
     
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -89,6 +101,7 @@ def save_aggregation_metadata(
             "mlm_csv": mlm_checksum,
             "group_csv": group_checksum,
         },
+        "groups": groups_structure,
         "settings": {
             "top_k": settings.get("top_k"),
             "lemma_col": settings.get("lemma_col", "lemma"),
@@ -560,6 +573,8 @@ def run_cli() -> None:
         output_checksum,
         aggregation_settings,
         stats,
+        group_labels,
+        lemma_to_groups,
     )
     
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
@@ -818,6 +833,8 @@ def run_gui() -> None:
                     output_checksum,
                     aggregation_settings,
                     stats,
+                    group_labels,
+                    lemma_to_groups,
                 )
                 
                 self.progress_update.emit(f"✓ Written {processed:,} rows ({skipped:,} skipped)")
