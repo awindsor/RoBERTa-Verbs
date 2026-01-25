@@ -356,21 +356,14 @@ def run_cli() -> None:
         tool_name = raw_metadata.get("tool", "unknown")
         logger.info(f"This metadata is from '{tool_name}'")
         
-        if tool_name == "MLMGroupAggregator":
-            metadata = raw_metadata
-            # Preserve source metadata if it exists (chaining)
-            source_metadata = metadata.get("source_metadata")
-        elif tool_name == "ROBERTAMaskedLanguageModelVerbs":
-            metadata = raw_metadata
-            source_metadata = metadata.get("source_metadata")
-        else:
-            # Unknown tool - just use what we loaded
-            metadata = raw_metadata
-            source_metadata = metadata.get("source_metadata")
+        metadata = raw_metadata
+        source_metadata = metadata.get("source_metadata")
         
-        # Use loaded settings as defaults, CLI args override
-        if metadata.get("tool") == "MLMGroupAggregator":
-            settings = metadata.get("settings", {})
+        # Extract and apply settings from loaded metadata
+        settings = metadata.get("settings", {})
+        
+        # Apply settings based on tool type
+        if tool_name in ["MLMGroupAggregator", "ROBERTAMaskedLanguageModelVerbs"]:
             if not args.top_k or args.top_k <= 0:
                 args.top_k = settings.get("top_k", 0)
             if args.lemma_col == "lemma":
@@ -380,8 +373,11 @@ def run_cli() -> None:
             if not args.include_count:
                 args.include_count = settings.get("include_count", False)
         
-        # If MLM metadata, infer MLM CSV path if not provided
-        if metadata.get("tool") == "ROBERTAMaskedLanguageModelVerbs" and args.mlm_csv is None:
+        # Infer input CSV path based on tool type
+        if tool_name == "ROBERTAMaskedLanguageModelVerbs" and args.mlm_csv is None:
+            args.mlm_csv = metadata.get("output_file")
+        elif tool_name == "SpaCyVerbExtractor" and args.mlm_csv is None:
+            # Use SpaCyVerbExtractor output as MLM CSV input
             args.mlm_csv = metadata.get("output_file")
     
     mlm_path = Path(args.mlm_csv)
@@ -1025,22 +1021,36 @@ def run_gui() -> None:
             """Load settings from metadata JSON."""
             try:
                 metadata = load_aggregation_metadata(json_path)
-                if metadata.get("tool") != "MLMGroupAggregator":
-                    QMessageBox.warning(self, "Wrong Metadata", "This is not MLMGroupAggregator metadata")
-                    return
-                
+                tool = metadata.get("tool", "unknown")
                 settings = metadata.get("settings", {})
                 input_files = metadata.get("input_files", {})
                 
-                if input_files.get("mlm_csv"):
-                    self.mlm_input.setText(input_files["mlm_csv"])
-                if input_files.get("group_csv"):
-                    self.group_input.setText(input_files["group_csv"])
-                
-                self.topk_spin.setValue(settings.get("top_k", 0))
-                self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
-                self.short_check.setChecked(settings.get("short", False))
-                self.count_check.setChecked(settings.get("include_count", False))
+                # Handle ROBERTAMaskedLanguageModelVerbs metadata
+                if tool == "ROBERTAMaskedLanguageModelVerbs":
+                    if input_files.get("mlm_csv"):
+                        self.mlm_input.setText(input_files["mlm_csv"])
+                    # User must provide group CSV
+                    self.topk_spin.setValue(settings.get("top_k", 0))
+                    self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
+                    self.short_check.setChecked(settings.get("short", False))
+                    self.count_check.setChecked(settings.get("include_count", False))
+                # Handle MLMGroupAggregator metadata
+                elif tool == "MLMGroupAggregator":
+                    if input_files.get("mlm_csv"):
+                        self.mlm_input.setText(input_files["mlm_csv"])
+                    if input_files.get("group_csv"):
+                        self.group_input.setText(input_files["group_csv"])
+                    self.topk_spin.setValue(settings.get("top_k", 0))
+                    self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
+                    self.short_check.setChecked(settings.get("short", False))
+                    self.count_check.setChecked(settings.get("include_count", False))
+                # Handle SpaCyVerbExtractor metadata - use as MLM CSV input
+                elif tool == "SpaCyVerbExtractor":
+                    self.mlm_input.setText(metadata.get("output_file", ""))
+                    # User must provide group CSV
+                else:
+                    QMessageBox.warning(self, "Unknown Metadata", f"This metadata is from '{tool}'.\nExpected ROBERTAMaskedLanguageModelVerbs, MLMGroupAggregator, or SpaCyVerbExtractor.")
+                    return
                 
                 self.log(f"✓ Loaded settings from: {json_path}")
             except Exception as e:
