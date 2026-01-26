@@ -55,6 +55,60 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 
 # ============================================================================
+# VERSION TRACKING
+# ============================================================================
+
+def get_mlm_version_info(model_name: str) -> Dict:
+    """Get transformers, torch, and model version information."""
+    import transformers
+    return {
+        "transformers": transformers.__version__,
+        "torch": torch.__version__,
+        "model": model_name,
+    }
+
+
+def check_mlm_version_compatibility(metadata: Dict, logger) -> None:
+    """Check if transformers/torch versions match metadata and warn if different."""
+    if "versions" not in metadata:
+        return
+    
+    meta_versions = metadata.get("versions", {})
+    current_model = metadata.get("settings", {}).get("model", "roberta-base")
+    current_versions = get_mlm_version_info(current_model)
+    
+    if meta_versions.get("transformers") != current_versions.get("transformers"):
+        logger.warning(
+            f"transformers version mismatch: metadata has {meta_versions.get('transformers')}, "
+            f"current is {current_versions.get('transformers')}"
+        )
+    
+    if meta_versions.get("torch") != current_versions.get("torch"):
+        logger.warning(
+            f"torch version mismatch: metadata has {meta_versions.get('torch')}, "
+            f"current is {current_versions.get('torch')}"
+        )
+
+
+def reconstruct_mlm_command(input_csv: str, output_csv: str, args) -> str:
+    """Reconstruct the CLI command that would reproduce this MLM run."""
+    cmd = ["python", "RoBERTaMaskedLanguageModelVerbs.py", input_csv, output_csv]
+    
+    if args.model != "roberta-base":
+        cmd.extend(["--model", args.model])
+    if args.batch_size != 16:
+        cmd.extend(["--batch-size", str(args.batch_size)])
+    if args.top_k != 10:
+        cmd.extend(["--top-k", str(args.top_k)])
+    if args.device:
+        cmd.extend(["--device", args.device])
+    if args.debug_limit:
+        cmd.extend(["--debug-limit", str(args.debug_limit)])
+    
+    return " ".join(cmd)
+
+
+# ============================================================================
 # METADATA AND UTILITY FUNCTIONS
 # ============================================================================
 
@@ -75,11 +129,13 @@ def save_mlm_metadata(
     settings: Dict,
     stats: Dict,
     source_metadata: Optional[Dict] = None,
+    command: Optional[str] = None,
 ) -> None:
     """Save MLM inference metadata to JSON file alongside output.
     
     Args:
         source_metadata: Metadata from previous tool (e.g., SpaCyVerbExtractor) for chaining
+        command: CLI command to reproduce this run
     """
     json_path = output_path.with_suffix(".json")
     
@@ -91,6 +147,7 @@ def save_mlm_metadata(
         "input_checksum": input_checksum,
         "output_file": str(output_path),
         "output_checksum": output_checksum,
+        "command": command,
         "settings": settings,
         "statistics": stats,
     }
@@ -246,6 +303,10 @@ def run_cli() -> None:
         
         metadata = load_mlm_metadata(metadata_path)
         tool_name = metadata.get("tool", "unknown")
+        
+        # Check version compatibility
+        if tool_name == "RoBERTaMaskedLanguageModelVerbs":
+            check_mlm_version_compatibility(metadata, logger)
         
         # Check if this is a SpaCyVerbExtractor or FilterSpaCyVerbs JSON
         if tool_name == "SpaCyVerbExtractor":
@@ -462,7 +523,9 @@ def run_cli() -> None:
         "elapsed_seconds": round(elapsed_time, 2),
     }
     
-    save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata)
+    command = reconstruct_mlm_command(args.input_csv, args.output_csv, args)
+    
+    save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata, command)
 
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} time={elapsed_time:.1f}s output={args.output_csv}")
     logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
@@ -649,7 +712,14 @@ def run_gui() -> None:
                     "elapsed_seconds": round(elapsed_time, 2),
                 }
                 
-                save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None)
+                # Reconstruct command for GUI mode
+                gui_command = (
+                    f"python RoBERTaMaskedLanguageModelVerbs.py {self.input_path} {self.output_path} "
+                    f"--model {self.model_name} --batch-size {self.batch_size} --top-k {self.top_k} "
+                    f"--device {dev}"
+                )
+                
+                save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command)
                 
                 self.progress_update.emit(f"✓ Written {processed:,} rows in {elapsed_time:.1f}s")
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")

@@ -54,6 +54,19 @@ PROB_COL_RE = re.compile(r"^prob_(\d+)$")
 # METADATA FUNCTIONS
 # ============================================================================
 
+def get_aggregator_version_info() -> Dict:
+    """Get version information for MLMGroupAggregator dependencies."""
+    try:
+        import lemminflect
+        lemminflect_version = lemminflect.__version__
+    except (ImportError, AttributeError):
+        lemminflect_version = "unknown"
+    
+    return {
+        "lemminflect": lemminflect_version,
+    }
+
+
 def compute_file_md5(path: Path) -> str:
     """Compute MD5 checksum of a file."""
     md5 = hashlib.md5()

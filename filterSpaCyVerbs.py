@@ -45,6 +45,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 # ============================================================================
+# METADATA FUNCTIONS
+# ============================================================================
+
+def get_version_info() -> Dict:
+    """Get version information for FilterSpaCyVerbs dependencies."""
+    import sys
+    return {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    }
+
+
+# ============================================================================
 # CORE FILTERING LOGIC (shared by CLI and GUI)
 # ============================================================================
 
@@ -65,11 +77,13 @@ def save_filter_metadata(
     args: Dict,
     stats: Dict,
     source_metadata: Optional[Dict] = None,
+    command: Optional[str] = None,
 ) -> None:
     """Save filtering metadata to JSON file alongside output.
     
     Args:
         source_metadata: Input metadata (e.g., from SpaCyVerbExtractor) for chaining
+        command: CLI command to reproduce this run
     """
     json_path = output_path.with_suffix(".json")
     
@@ -81,6 +95,7 @@ def save_filter_metadata(
         "input_checksum": input_checksum,
         "output_file": str(output_path),
         "output_checksum": output_checksum,
+        "command": command,
         "settings": {
             "field": args.get("field", "lemma"),
             "min_freq": args.get("min_freq"),
@@ -182,6 +197,22 @@ def filter_rows(
 # ============================================================================
 # CLI MODE
 # ============================================================================
+
+def reconstruct_filter_command(input_csv: str, output_csv: str, args) -> str:
+    """Reconstruct the CLI command that would reproduce this filtering run."""
+    cmd = ["python", "FilterSpaCyVerbs.py", str(input_csv), str(output_csv)]
+    
+    if args.field != "lemma":
+        cmd.extend(["--field", args.field])
+    if args.min_freq is not None:
+        cmd.extend(["--min-freq", str(args.min_freq)])
+    if args.max_freq is not None:
+        cmd.extend(["--max-freq", str(args.max_freq)])
+    if args.strict_checksum:
+        cmd.append("--strict-checksum")
+    
+    return " ".join(cmd)
+
 
 def run_cli() -> None:
     """Run in CLI mode."""
@@ -331,7 +362,8 @@ def run_cli() -> None:
         "unique_values": len(counts),
     }
     
-    save_filter_metadata(output_path, input_path, input_checksum, output_checksum, filter_args, stats, source_metadata)
+    command = reconstruct_filter_command(args.input_csv, args.output_csv, args)
+    save_filter_metadata(output_path, input_path, input_checksum, output_checksum, filter_args, stats, source_metadata, command=command)
     
     print(f"✓ Wrote {rows_written} rows to {output_path}")
     print(f"✓ Filtered out {rows_filtered} rows")
@@ -438,7 +470,17 @@ def run_gui() -> None:
                     "unique_values": len(counts),
                 }
                 
-                save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats, self.source_metadata)
+                # Build GUI command reconstruction
+                gui_cmd = ["python", "FilterSpaCyVerbs.py", str(self.input_path), str(self.output_path)]
+                if self.field != "lemma":
+                    gui_cmd.extend(["--field", self.field])
+                if self.min_freq is not None:
+                    gui_cmd.extend(["--min-freq", str(self.min_freq)])
+                if self.max_freq is not None:
+                    gui_cmd.extend(["--max-freq", str(self.max_freq)])
+                command = " ".join(gui_cmd)
+                
+                save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats, self.source_metadata, command=command)
                 
                 self.progress_update.emit(f"✓ Wrote {rows_written} rows")
                 self.progress_update.emit(f"✓ Filtered out {rows_filtered} rows")

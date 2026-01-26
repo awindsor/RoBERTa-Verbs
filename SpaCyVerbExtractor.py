@@ -96,11 +96,13 @@ def save_run_metadata(
     args: Dict[str, any],
     stats: Dict[str, any],
     status: str = "completed",
+    command: Optional[str] = None,
 ) -> None:
     """Save extraction metadata to JSON file alongside output.
     
     Args:
         status: "completed" or "stopped_by_user"
+        command: CLI command to reproduce this run
     """
     json_path = output_path.with_suffix(".json")
     
@@ -113,6 +115,7 @@ def save_run_metadata(
         "output_checksum": output_checksum,
         "input_files": [str(p) for p in input_paths],
         "input_checksums": input_checksums,
+        "command": command,
         "settings": {
             "model": args.get("model", "en_core_web_sm"),
             "encoding": args.get("encoding", "utf-8"),
@@ -367,6 +370,44 @@ def setup_logging(level_name: str) -> logging.Logger:
         datefmt="%H:%M:%S",
     )
     return logging.getLogger("extract_verbs")
+
+
+def reconstruct_spacy_command(paths: List[str], output_file: str, args) -> str:
+    """Reconstruct the CLI command that would reproduce this extraction run."""
+    cmd = ["python", "SpaCyVerbExtractor.py"]
+    
+    # Add positional arguments
+    if args.paths_file:
+        cmd.extend(["--paths-file", args.paths_file])
+    else:
+        cmd.extend(paths)
+    
+    # Add optional arguments (non-defaults)
+    cmd.extend(["-o", output_file])
+    if args.model != "en_core_web_sm":
+        cmd.extend(["--model", args.model])
+    if args.encoding != "utf-8":
+        cmd.extend(["--encoding", args.encoding])
+    if args.include_aux:
+        cmd.append("--include-aux")
+    if args.chunk_size != 2_000_000:
+        cmd.extend(["--chunk-size", str(args.chunk_size)])
+    if args.overlap != 5_000:
+        cmd.extend(["--overlap", str(args.overlap)])
+    if args.dedupe_window != 50_000:
+        cmd.extend(["--dedupe-window", str(args.dedupe_window)])
+    if args.heartbeat_chunks != 10:
+        cmd.extend(["--heartbeat-chunks", str(args.heartbeat_chunks)])
+    if args.tsv:
+        cmd.append("--tsv")
+    if args.csv_text_column:
+        cmd.extend(["--csv-text-column", args.csv_text_column])
+    if args.include_csv_fields:
+        cmd.append("--include-csv-fields")
+    if args.log_level != "INFO":
+        cmd.extend(["--log-level", args.log_level])
+    
+    return " ".join(cmd)
 
 
 def run_cli() -> None:
@@ -831,7 +872,8 @@ def run_cli() -> None:
     }
     
     status = "stopped_by_user" if stopped_by_user else "completed"
-    save_run_metadata(out_path, paths, input_checksums, output_checksum, metadata_args, stats, status=status)
+    command = reconstruct_spacy_command([str(p) for p in paths], str(out_path), args)
+    save_run_metadata(out_path, paths, input_checksums, output_checksum, metadata_args, stats, status=status, command=command)
     logger.info(f"Wrote output: {out_path}")
     logger.info(f"Wrote metadata: {out_path.with_suffix('.json')}")
 
@@ -1154,7 +1196,28 @@ def run_gui() -> None:
                     "output_rows": overall_verbs,
                 }
                 
-                save_run_metadata(self.output_path, self.paths, input_checksums, output_checksum, metadata_args, stats, status=status)
+                # Build GUI command reconstruction
+                gui_cmd = ["python", "SpaCyVerbExtractor.py"] + [str(p) for p in self.paths]
+                gui_cmd.extend(["-o", str(self.output_path)])
+                if self.model != "en_core_web_sm":
+                    gui_cmd.extend(["--model", self.model])
+                if self.encoding != "utf-8":
+                    gui_cmd.extend(["--encoding", self.encoding])
+                if self.include_aux:
+                    gui_cmd.append("--include-aux")
+                if self.chunk_size != 2_000_000:
+                    gui_cmd.extend(["--chunk-size", str(self.chunk_size)])
+                if self.overlap != 5_000:
+                    gui_cmd.extend(["--overlap", str(self.overlap)])
+                if self.dedupe_window != 50_000:
+                    gui_cmd.extend(["--dedupe-window", str(self.dedupe_window)])
+                if self.heartbeat_chunks != 10:
+                    gui_cmd.extend(["--heartbeat-chunks", str(self.heartbeat_chunks)])
+                if self.use_tsv:
+                    gui_cmd.append("--tsv")
+                command = " ".join(gui_cmd)
+                
+                save_run_metadata(self.output_path, self.paths, input_checksums, output_checksum, metadata_args, stats, status=status, command=command)
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")
                 
                 self.finished.emit(True, f"Extraction complete. Output: {self.output_path}")
