@@ -413,120 +413,71 @@ def run_cli() -> None:
             logger.warning(msg)
     
     start_time = time.time()
-    
     group_labels, lemma_to_groups = load_groups_csv(args.group_csv, args.encoding, logger)
     
     processed = 0
     skipped = 0
     lemma_counts: Dict[str, int] = {}
     
-    with mlm_path.open(newline="", encoding=args.encoding) as fin:
-        reader = csv.DictReader(fin)
-        if reader.fieldnames is None:
-            raise SystemExit("Input MLM CSV has no header.")
-        fieldnames = reader.fieldnames
+    try:
+        with mlm_path.open(newline="", encoding=args.encoding) as fin:
+            reader = csv.DictReader(fin)
+            if reader.fieldnames is None:
+                raise SystemExit("Input MLM CSV has no header.")
 
-        if args.lemma_col not in fieldnames:
-            raise SystemExit(f"Input MLM CSV missing lemma column {args.lemma_col!r}")
+            fieldnames = reader.fieldnames
 
-        k = args.top_k if args.top_k > 0 else infer_top_k(fieldnames)
-        if k <= 0:
-            raise SystemExit("Could not infer top_k from header; provide --top-k explicitly.")
+            if args.lemma_col not in fieldnames:
+                raise SystemExit(f"Input MLM CSV missing lemma column {args.lemma_col!r}")
 
-        # Verify required token/prob columns
-        missing_cols = []
-        for i in range(1, k + 1):
-            if f"token_{i}" not in fieldnames:
-                missing_cols.append(f"token_{i}")
-            if f"prob_{i}" not in fieldnames:
-                missing_cols.append(f"prob_{i}")
-        if missing_cols:
-            raise SystemExit(
-                f"Missing required token/prob columns for top_k={k}: "
-                f"{missing_cols[:10]}{' ...' if len(missing_cols) > 10 else ''}"
-            )
+            k = args.top_k if args.top_k > 0 else infer_top_k(fieldnames)
+            if k <= 0:
+                raise SystemExit("Could not infer top_k from header; provide --top-k explicitly.")
 
-        # Build output columns
-        group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
-
-        if args.short:
-            out_fieldnames = [args.lemma_col] + group_out_cols
-            if args.include_count:
-                out_fieldnames.append("lemma_count")
-        else:
-            out_fieldnames = list(fieldnames) + group_out_cols
-
-        is_xlsx = output_path.suffix.lower() == ".xlsx"
-
-        if is_xlsx:
-            try:
-                from openpyxl import Workbook
-            except ImportError:
+            # Verify required token/prob columns
+            missing_cols = []
+            for i in range(1, k + 1):
+                if f"token_{i}" not in fieldnames:
+                    missing_cols.append(f"token_{i}")
+                if f"prob_{i}" not in fieldnames:
+                    missing_cols.append(f"prob_{i}")
+            if missing_cols:
                 raise SystemExit(
-                    "XLSX output requested but openpyxl is not installed. Install with: pip install openpyxl"
+                    f"Missing required token/prob columns for top_k={k}: "
+                    f"{missing_cols[:10]}{' ...' if len(missing_cols) > 10 else ''}"
                 )
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Aggregated"
-            ws.append(out_fieldnames)
 
-            for row in reader:
+            # Build output columns
+            group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
+
+            if args.short:
+                out_fieldnames = [args.lemma_col] + group_out_cols
+                if args.include_count:
+                    out_fieldnames.append("lemma_count")
+            else:
+                out_fieldnames = list(fieldnames) + group_out_cols
+
+            is_xlsx = output_path.suffix.lower() == ".xlsx"
+
+            if is_xlsx:
                 try:
-                    lemma = (row.get(args.lemma_col) or "").strip()
-                    if not lemma:
-                        raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
+                    from openpyxl import Workbook
+                    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+                except ImportError:
+                    raise SystemExit(
+                        "XLSX output requested but openpyxl is not installed. Install with: pip install openpyxl"
+                    )
 
-                    group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+                def _clean_cell(val):
+                    # Strip characters Excel cannot store (e.g., ASCII control chars)
+                    if isinstance(val, str):
+                        return ILLEGAL_CHARACTERS_RE.sub("", val)
+                    return val
 
-                    for i in range(1, k + 1):
-                        tok = row.get(f"token_{i}", "")
-                        p_str = row.get(f"prob_{i}", "")
-                        if not tok or not p_str:
-                            continue
-                        try:
-                            prob = float(p_str)
-                        except ValueError:
-                            continue
-
-                        key = normalize_pred_token(tok)
-                        gs = lemma_to_groups.get(key)
-                        if not gs:
-                            continue
-                        for g in gs:
-                            group_sums[g] += prob
-
-                    if args.short:
-                        out_row = {args.lemma_col: lemma}
-                        for g in group_labels:
-                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                        if args.include_count:
-                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                            out_row["lemma_count"] = str(lemma_counts[lemma])
-                    else:
-                        out_row = dict(row)
-                        for g in group_labels:
-                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-
-                    ws.append([out_row.get(col, "") for col in out_fieldnames])
-                    processed += 1
-
-                except Exception as e:
-                    skipped += 1
-                    if skipped <= 10:
-                        logger.warning(f"Skipping row due to error: {e}")
-                    continue
-
-                if args.log_every > 0 and processed % args.log_every == 0:
-                    logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
-
-            # Add groups sheet and save workbook
-            _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
-            wb.save(str(output_path))
-
-        else:
-            with output_path.open("w", newline="", encoding=args.encoding) as fout:
-                writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
-                writer.writeheader()
+                # Write-only workbook keeps memory usage low for large files
+                wb = Workbook(write_only=True)
+                ws = wb.create_sheet("Aggregated")
+                ws.append([_clean_cell(c) for c in out_fieldnames])
 
                 for row in reader:
                     try:
@@ -565,7 +516,7 @@ def run_cli() -> None:
                             for g in group_labels:
                                 out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
 
-                        writer.writerow(out_row)
+                        ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
                         processed += 1
 
                     except Exception as e:
@@ -576,47 +527,149 @@ def run_cli() -> None:
 
                     if args.log_every > 0 and processed % args.log_every == 0:
                         logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+
+                # Add groups sheet and save workbook
+                _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
+                wb.save(str(output_path))
+
+            else:
+                with output_path.open("w", newline="", encoding=args.encoding) as fout:
+                    writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
+                    writer.writeheader()
+
+                    for row in reader:
+                        try:
+                            lemma = (row.get(args.lemma_col) or "").strip()
+                            if not lemma:
+                                raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
+
+                            group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+                            for i in range(1, k + 1):
+                                tok = row.get(f"token_{i}", "")
+                                p_str = row.get(f"prob_{i}", "")
+                                if not tok or not p_str:
+                                    continue
+                                try:
+                                    prob = float(p_str)
+                                except ValueError:
+                                    continue
+
+                                key = normalize_pred_token(tok)
+                                gs = lemma_to_groups.get(key)
+                                if not gs:
+                                    continue
+                                for g in gs:
+                                    group_sums[g] += prob
+
+                            if args.short:
+                                out_row = {args.lemma_col: lemma}
+                                for g in group_labels:
+                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+                                if args.include_count:
+                                    lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                    out_row["lemma_count"] = str(lemma_counts[lemma])
+                            else:
+                                out_row = dict(row)
+                                for g in group_labels:
+                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+                            writer.writerow(out_row)
+                            processed += 1
+
+                        except Exception as e:
+                            skipped += 1
+                            if skipped <= 10:
+                                logger.warning(f"Skipping row due to error: {e}")
+                            continue
+
+                        if args.log_every > 0 and processed % args.log_every == 0:
+                            logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+        
+        elapsed_time = time.time() - start_time
+        
+        # Compute checksums and save metadata
+        logger.info("Computing file checksums...")
+        mlm_checksum = compute_file_md5(mlm_path)
+        group_checksum = compute_file_md5(group_path)
+        output_checksum = compute_file_md5(output_path)
+        
+        aggregation_settings = {
+            "top_k": k,
+            "lemma_col": args.lemma_col,
+            "short": args.short,
+            "include_count": args.include_count,
+            "encoding": args.encoding,
+            "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
+        }
+        
+        stats = {
+            "rows_written": processed,
+            "rows_skipped": skipped,
+            "groups_created": len(group_labels),
+            "elapsed_seconds": round(elapsed_time, 2),
+        }
+        
+        save_aggregation_metadata(
+            output_path,
+            mlm_path,
+            group_path,
+            mlm_checksum,
+            group_checksum,
+            output_checksum,
+            aggregation_settings,
+            stats,
+            group_labels,
+            lemma_to_groups,
+            source_metadata,
+        )
+        
+        logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
+        logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
     
-    elapsed_time = time.time() - start_time
-    
-    # Compute checksums and save metadata
-    logger.info("Computing file checksums...")
-    mlm_checksum = compute_file_md5(mlm_path)
-    group_checksum = compute_file_md5(group_path)
-    output_checksum = compute_file_md5(output_path)
-    
-    aggregation_settings = {
-        "top_k": k,
-        "lemma_col": args.lemma_col,
-        "short": args.short,
-        "include_count": args.include_count,
-        "encoding": args.encoding,
-        "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
-    }
-    
-    stats = {
-        "rows_written": processed,
-        "rows_skipped": skipped,
-        "groups_created": len(group_labels),
-        "elapsed_seconds": round(elapsed_time, 2),
-    }
-    
-    save_aggregation_metadata(
-        output_path,
-        mlm_path,
-        group_path,
-        mlm_checksum,
-        group_checksum,
-        output_checksum,
-        aggregation_settings,
-        stats,
-        group_labels,
-        lemma_to_groups,
-        source_metadata,
-    )
-    
-    logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
-    logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
+    except KeyboardInterrupt:
+        logger.info("\\nCancellation requested. Saving incomplete results...")
+        elapsed_time = time.time() - start_time
+        
+        # Save metadata with incomplete flag
+        mlm_checksum = compute_file_md5(mlm_path)
+        group_checksum = compute_file_md5(group_path)
+        output_checksum = compute_file_md5(output_path) if output_path.exists() else ""
+        
+        aggregation_settings = {
+            "top_k": k,
+            "lemma_col": args.lemma_col,
+            "short": args.short,
+            "include_count": args.include_count,
+            "encoding": args.encoding,
+            "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
+        }
+        
+        stats = {
+            "rows_written": processed,
+            "rows_skipped": skipped,
+            "groups_created": len(group_labels),
+            "elapsed_seconds": round(elapsed_time, 2),
+            "incomplete": True,
+        }
+        
+        save_aggregation_metadata(
+            output_path,
+            mlm_path,
+            group_path,
+            mlm_checksum,
+            group_checksum,
+            output_checksum,
+            aggregation_settings,
+            stats,
+            group_labels,
+            lemma_to_groups,
+            source_metadata,
+        )
+        
+        logger.info(f"Cancelled. Written={processed:,} skipped={skipped:,}")
+        logger.info(f"✓ Saved incomplete metadata to {output_path.with_suffix('.json')}")
+        raise SystemExit(0)
 
 
 # ============================================================================
@@ -639,6 +692,7 @@ def run_gui() -> None:
             QPushButton,
             QFileDialog,
             QTextEdit,
+            QProgressBar,
             QCheckBox,
             QSpinBox,
             QMessageBox,
@@ -653,6 +707,7 @@ def run_gui() -> None:
         """Worker thread for group aggregation without blocking UI."""
         
         progress_update = Signal(str)
+        progress_value = Signal(int, int)  # processed, total
         finished = Signal(bool, str)
         
         def __init__(
@@ -675,6 +730,11 @@ def run_gui() -> None:
             self.short = short
             self.include_count = include_count
             self.encoding = encoding
+            self._cancelled = False
+        
+        def cancel(self):
+            """Request cancellation of aggregation."""
+            self._cancelled = True
         
         def run(self):
             """Run the aggregation in the worker thread."""
@@ -689,16 +749,24 @@ def run_gui() -> None:
                 group_labels, lemma_to_groups = load_groups_csv(
                     str(self.group_csv_path),
                     self.encoding,
-                    logger
+                    logger,
                 )
                 
                 self.progress_update.emit(f"Reading: {self.mlm_csv_path}")
                 self.progress_update.emit("")
-                
+
+                # Determine total rows for progress bar (header excluded)
+                total_rows = 0
+                try:
+                    with self.mlm_csv_path.open(encoding=self.encoding) as fin_count:
+                        total_rows = max(sum(1 for _ in fin_count) - 1, 0)
+                except Exception:
+                    total_rows = 0
+
                 processed = 0
                 skipped = 0
                 lemma_counts: Dict[str, int] = {}
-                
+
                 with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin:
                     reader = csv.DictReader(fin)
                     if reader.fieldnames is None:
@@ -726,14 +794,22 @@ def run_gui() -> None:
                     if is_xlsx:
                         try:
                             from openpyxl import Workbook
+                            from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
                         except ImportError:
                             raise ValueError(
                                 "XLSX output requested but openpyxl is not installed. Install with: pip install openpyxl"
                             )
-                        wb = Workbook()
-                        ws = wb.active
-                        ws.title = "Aggregated"
-                        ws.append(out_fieldnames)
+
+                        def _clean_cell(val):
+                            # Strip characters Excel cannot store (e.g., ASCII control chars)
+                            if isinstance(val, str):
+                                return ILLEGAL_CHARACTERS_RE.sub("", val)
+                            return val
+
+                        # Write-only workbook keeps memory usage low for large files
+                        wb = Workbook(write_only=True)
+                        ws = wb.create_sheet("Aggregated")
+                        ws.append([_clean_cell(c) for c in out_fieldnames])
 
                         for row in reader:
                             try:
@@ -772,11 +848,16 @@ def run_gui() -> None:
                                     for g in group_labels:
                                         out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
 
-                                ws.append([out_row.get(col, "") for col in out_fieldnames])
+                                ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
                                 processed += 1
-
-                                if processed % 10000 == 0:
-                                    self.progress_update.emit(f"Processed {processed:,} rows...")
+                                if total_rows:
+                                    if processed % 1000 == 0 or processed == total_rows:
+                                        self.progress_value.emit(processed, total_rows)
+                                
+                                # Check for cancellation
+                                if self._cancelled:
+                                    self.progress_update.emit("Cancellation requested...")
+                                    raise KeyboardInterrupt("User cancelled")
 
                             except Exception as e:
                                 skipped += 1
@@ -831,9 +912,14 @@ def run_gui() -> None:
 
                                     writer.writerow(out_row)
                                     processed += 1
-
-                                    if processed % 10000 == 0:
-                                        self.progress_update.emit(f"Processed {processed:,} rows...")
+                                    if total_rows:
+                                        if processed % 1000 == 0 or processed == total_rows:
+                                            self.progress_value.emit(processed, total_rows)
+                                    
+                                    # Check for cancellation
+                                    if self._cancelled:
+                                        self.progress_update.emit("Cancellation requested...")
+                                        raise KeyboardInterrupt("User cancelled")
 
                                 except Exception as e:
                                     skipped += 1
@@ -843,6 +929,8 @@ def run_gui() -> None:
                 
                 # Save metadata
                 self.progress_update.emit("Computing checksums and saving metadata...")
+                if total_rows:
+                    self.progress_value.emit(total_rows, total_rows)
                 mlm_checksum = compute_file_md5(self.mlm_csv_path)
                 group_checksum = compute_file_md5(self.group_csv_path)
                 output_checksum = compute_file_md5(self.output_csv_path)
@@ -879,6 +967,49 @@ def run_gui() -> None:
                 self.progress_update.emit(f"✓ Written {processed:,} rows ({skipped:,} skipped)")
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_csv_path.with_suffix('.json')}")
                 self.finished.emit(True, f"Aggregation complete. Output: {self.output_csv_path}")
+                
+            except KeyboardInterrupt:
+                self.progress_update.emit("Saving incomplete results...")
+                # Save metadata with incomplete flag
+                try:
+                    mlm_checksum = compute_file_md5(self.mlm_csv_path)
+                    group_checksum = compute_file_md5(self.group_csv_path)
+                    output_checksum = compute_file_md5(self.output_csv_path) if self.output_csv_path.exists() else ""
+                    
+                    aggregation_settings = {
+                        "top_k": k,
+                        "lemma_col": self.lemma_col,
+                        "short": self.short,
+                        "include_count": self.include_count,
+                        "encoding": self.encoding,
+                        "output_format": "xlsx" if self.output_csv_path.suffix.lower() == ".xlsx" else "csv",
+                    }
+                    
+                    stats = {
+                        "rows_written": processed,
+                        "rows_skipped": skipped,
+                        "groups_created": len(group_labels),
+                        "incomplete": True,
+                    }
+                    
+                    save_aggregation_metadata(
+                        self.output_csv_path,
+                        self.mlm_csv_path,
+                        self.group_csv_path,
+                        mlm_checksum,
+                        group_checksum,
+                        output_checksum,
+                        aggregation_settings,
+                        stats,
+                        group_labels,
+                        lemma_to_groups,
+                        None,
+                    )
+                    self.progress_update.emit(f"✓ Saved incomplete metadata: {self.output_csv_path.with_suffix('.json')}")
+                except Exception as meta_err:
+                    self.progress_update.emit(f"⚠ Failed to save metadata: {meta_err}")
+                
+                self.finished.emit(False, f"Aggregation cancelled. Processed {processed:,} rows.")
                 
             except Exception as e:
                 self.progress_update.emit(f"✗ Error: {str(e)}")
@@ -990,6 +1121,14 @@ def run_gui() -> None:
             # Progress section
             progress_group = QGroupBox("Progress")
             progress_layout = QVBoxLayout()
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setTextVisible(True)
+            progress_layout.addWidget(self.progress_bar)
+            self.progress_label = QLabel("Ready")
+            self.progress_label.setStyleSheet("color: #666; font-style: italic;")
+            progress_layout.addWidget(self.progress_label)
             self.progress_text = QTextEdit()
             self.progress_text.setReadOnly(True)
             self.progress_text.setMaximumHeight(200)
@@ -1000,7 +1139,7 @@ def run_gui() -> None:
             # Control buttons
             button_layout = QHBoxLayout()
             self.start_btn = QPushButton("Start Aggregation")
-            self.start_btn.clicked.connect(self.start_aggregation)
+            self.start_btn.clicked.connect(self.toggle_aggregation)
             self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
             button_layout.addStretch()
             button_layout.addWidget(self.start_btn)
@@ -1013,6 +1152,10 @@ def run_gui() -> None:
             file, _ = QFileDialog.getOpenFileName(self, "Select MLM CSV", "", "CSV Files (*.csv)")
             if file:
                 self.mlm_input.setText(file)
+                # Auto-suggest output in the same directory if not already set
+                if not self.output_input.text() or self.output_input.text() == "aggregated_output.csv":
+                    out_path = Path(file).with_name("aggregated_output.csv")
+                    self.output_input.setText(str(out_path))
         
         def browse_group(self):
             file, _ = QFileDialog.getOpenFileName(self, "Select Group CSV", "", "CSV Files (*.csv)")
@@ -1023,7 +1166,7 @@ def run_gui() -> None:
             file, _ = QFileDialog.getSaveFileName(
                 self,
                 "Select Output File",
-                "aggregated_output.csv",
+                str(Path(self.mlm_input.text()).with_name("aggregated_output.csv")) if self.mlm_input.text() else "aggregated_output.csv",
                 "CSV or Excel (*.csv *.xlsx)"
             )
             if file:
@@ -1046,6 +1189,8 @@ def run_gui() -> None:
                 if tool == "RoBERTaMaskedLanguageModelVerbs":
                     if input_files.get("mlm_csv"):
                         self.mlm_input.setText(input_files["mlm_csv"])
+                    if metadata.get("output_file"):
+                        self.output_input.setText(metadata.get("output_file", ""))
                     # User must provide group CSV
                     self.topk_spin.setValue(settings.get("top_k", 0))
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
@@ -1057,6 +1202,8 @@ def run_gui() -> None:
                         self.mlm_input.setText(input_files["mlm_csv"])
                     if input_files.get("group_csv"):
                         self.group_input.setText(input_files["group_csv"])
+                    if metadata.get("output_file"):
+                        self.output_input.setText(metadata.get("output_file", ""))
                     self.topk_spin.setValue(settings.get("top_k", 0))
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
                     self.short_check.setChecked(settings.get("short", False))
@@ -1064,6 +1211,10 @@ def run_gui() -> None:
                 # Handle SpaCyVerbExtractor metadata - use as MLM CSV input
                 elif tool == "SpaCyVerbExtractor":
                     self.mlm_input.setText(metadata.get("output_file", ""))
+                    if metadata.get("output_file"):
+                        # Suggest a new output next to the input
+                        out_path = Path(metadata.get("output_file")).with_name("aggregated_output.csv")
+                        self.output_input.setText(str(out_path))
                     # User must provide group CSV
                 else:
                     QMessageBox.warning(self, "Unknown Metadata", f"This metadata is from '{tool}'.\nExpected RoBERTaMaskedLanguageModelVerbs, MLMGroupAggregator, or SpaCyVerbExtractor.")
@@ -1079,9 +1230,28 @@ def run_gui() -> None:
             self.progress_text.verticalScrollBar().setValue(
                 self.progress_text.verticalScrollBar().maximum()
             )
+
+        def update_progress(self, processed: int, total: int):
+            if total <= 0:
+                self.progress_bar.setMaximum(0)
+                self.progress_label.setText("Processing...")
+                return
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(processed)
+            self.progress_bar.setFormat(f"{processed:,}/{total:,} rows")
+            
+            # Update progress label with percentage and rate
+            percent = (processed / total) * 100 if total > 0 else 0
+            self.progress_label.setText(f"Processing: {processed:,} / {total:,} rows ({percent:.1f}%)")
         
-        def start_aggregation(self):
-            """Start the aggregation process."""
+        def toggle_aggregation(self):
+            """Start or stop the aggregation process."""
+            # If worker is running, cancel it
+            if self.worker and self.worker.isRunning():
+                self.worker.cancel()
+                return
+            
+            # Otherwise start new aggregation
             if not self.mlm_input.text():
                 QMessageBox.warning(self, "Missing File", "Please select an MLM CSV file")
                 return
@@ -1113,6 +1283,13 @@ def run_gui() -> None:
             self.log("")
             
             self.start_btn.setEnabled(False)
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("")
+            
+            # Change button to "End Aggregation"
+            self.start_btn.setText("End Aggregation")
+            self.start_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 8px;")
             
             self.worker = AggregationWorker(
                 mlm_path,
@@ -1126,12 +1303,18 @@ def run_gui() -> None:
             )
             
             self.worker.progress_update.connect(self.log)
+            self.worker.progress_value.connect(self.update_progress)
             self.worker.finished.connect(self.on_finished)
             self.worker.start()
         
         def on_finished(self, success: bool, message: str):
             """Handle aggregation completion."""
             self.start_btn.setEnabled(True)
+            self.start_btn.setText("Start Aggregation")
+            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+            self.progress_bar.setMaximum(1)
+            self.progress_bar.setValue(1)
+            self.progress_bar.setFormat("Done" if success else "Cancelled")
             self.log("")
             self.log("=" * 60)
             self.log(message)

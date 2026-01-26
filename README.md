@@ -246,7 +246,7 @@ python tagged_verbs_to_groups.py tagged_input.csv group_output.csv --ignore thin
 
 ### Phase 5: Statistical Aggregation
 
-#### [lem_to_group_prob.py](lem_to_group_prob.py)
+#### [LemmaToGroupProbs.py](LemmaToGroupProbs.py)
 Aggregates group probabilities by lemma, producing summary statistics.
 
 **Input:** MLM output CSV with group probability columns
@@ -277,10 +277,10 @@ run,18.9,61.3,19.8,98
 
 **Usage:**
 ```bash
-python lem_to_group_prob.py mlm_out.csv output.csv
-python lem_to_group_prob.py mlm_out.csv output.xlsx  # Excel output
-python lem_to_group_prob.py mlm_out.csv output.xlsx --second-threshold 0.40
-python lem_to_group_prob.py mlm_out.csv output.csv --group-cols group1,group2,group3
+python LemmaToGroupProbs.py mlm_out.csv output.csv
+python LemmaToGroupProbs.py mlm_out.csv output.xlsx  # Excel output
+python LemmaToGroupProbs.py mlm_out.csv output.xlsx --second-threshold 0.40
+python LemmaToGroupProbs.py mlm_out.csv output.csv --group-cols group1,group2,group3
 ```
 
 **Requirements for Excel:**
@@ -362,7 +362,7 @@ Raw Text Files (filepaths.txt)
          ↓
     verbs_with_mlm.csv  (token predictions + optional group probs)
          ↓
-   [lem_to_group_prob]
+     [LemmaToGroupProbs]
          ↓
     lem_gp_prob.csv / .xlsx  (aggregated statistics)
          
