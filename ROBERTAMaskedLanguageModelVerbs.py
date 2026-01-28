@@ -130,12 +130,14 @@ def save_mlm_metadata(
     stats: Dict,
     source_metadata: Optional[Dict] = None,
     command: Optional[str] = None,
+    status: str = "completed",
 ) -> None:
     """Save MLM inference metadata to JSON file alongside output.
     
     Args:
         source_metadata: Metadata from previous tool (e.g., SpaCyVerbExtractor) for chaining
         command: CLI command to reproduce this run
+        status: "completed" or "stopped_by_user"
     """
     json_path = output_path.with_suffix(".json")
     
@@ -143,6 +145,7 @@ def save_mlm_metadata(
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "RoBERTaMaskedLanguageModelVerbs",
         "versions": get_mlm_version_info(settings["model"]),
+        "status": status,
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),
@@ -425,8 +428,9 @@ def run_cli() -> None:
 
     start_time = time.time()
 
-    with open(args.input_csv, newline="", encoding=args.encoding) as fin, \
-         open(args.output_csv, "w", newline="", encoding=args.encoding) as fout:
+    try:
+        with open(args.input_csv, newline="", encoding=args.encoding) as fin, \
+             open(args.output_csv, "w", newline="", encoding=args.encoding) as fout:
         reader = csv.DictReader(fin)
         if reader.fieldnames is None:
             raise SystemExit("Input CSV has no header.")
@@ -529,6 +533,37 @@ def run_cli() -> None:
 
     logger.info(f"Done. Written={processed:,} skipped={skipped:,} time={elapsed_time:.1f}s output={args.output_csv}")
     logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
+    
+    except KeyboardInterrupt:
+        logger.info("\nCancellation requested. Saving incomplete results...")
+        elapsed_time = time.time() - start_time
+        
+        # Save metadata with incomplete flag
+        input_checksum = compute_file_md5(input_path)
+        output_checksum = compute_file_md5(output_path) if output_path.exists() else ""
+        
+        mlm_settings = {
+            "model": args.model,
+            "batch_size": args.batch_size,
+            "top_k": args.top_k,
+            "device": str(dev),
+            "encoding": args.encoding,
+            "debug_limit": args.debug_limit if args.debug_limit else None,
+        }
+        
+        stats = {
+            "rows_seen": seen,
+            "rows_written": processed,
+            "rows_skipped": skipped,
+            "elapsed_seconds": round(elapsed_time, 2),
+        }
+        
+        command = reconstruct_mlm_command(args.input_csv, args.output_csv, args)
+        
+        save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata, command, status="stopped_by_user")
+        
+        logger.info(f"Cancelled. Written={processed:,} skipped={skipped:,}")
+        logger.info(f"✓ Saved incomplete metadata to {output_path.with_suffix('.json')}")
 
 
 # ============================================================================
@@ -760,7 +795,6 @@ def run_gui() -> None:
                             "rows_written": processed,
                             "rows_skipped": skipped,
                             "elapsed_seconds": round(elapsed_time, 2),
-                            "incomplete": True,
                         }
                         
                         gui_command = (
@@ -769,7 +803,7 @@ def run_gui() -> None:
                             f"--device {dev}"
                         )
                         
-                        save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command)
+                        save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command, status="stopped_by_user")
                         self.progress_update.emit(f"✓ Saved incomplete metadata: {self.output_path.with_suffix('.json')}")
                     except Exception as meta_err:
                         self.progress_update.emit(f"⚠ Failed to save metadata: {meta_err}")
