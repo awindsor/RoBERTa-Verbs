@@ -174,10 +174,10 @@ def verify_input_checksums(
             actual = compute_file_md5(mlm_path)
             if actual != expected:
                 status["mlm_ok"] = False
-                messages.append(f"⚠ MLM CSV has changed (checksum mismatch)")
+                messages.append("⚠ MLM CSV has changed (checksum mismatch)")
         else:
             status["mlm_ok"] = False
-            messages.append(f"⚠ MLM CSV not found")
+            messages.append("⚠ MLM CSV not found")
     
     # Check group CSV
     if "group_csv" in input_checksums:
@@ -186,10 +186,10 @@ def verify_input_checksums(
             actual = compute_file_md5(group_path)
             if actual != expected:
                 status["group_ok"] = False
-                messages.append(f"⚠ Group CSV has changed (checksum mismatch)")
+                messages.append("⚠ Group CSV has changed (checksum mismatch)")
         else:
             status["group_ok"] = False
-            messages.append(f"⚠ Group CSV not found")
+            messages.append("⚠ Group CSV not found")
     
     message = " | ".join(messages) if messages else "✓ All input files verified"
     return status, message
@@ -375,33 +375,38 @@ def run_cli() -> None:
         if tool_name not in supported_tools:
             raise SystemExit(
                 f"Unsupported metadata source: '{tool_name}'\n"
-                f"MLMGroupAggregator accepts metadata from:\n"
-                f"  - RoBERTaMaskedLanguageModelVerbs\n"
-                f"  - MLMGroupAggregator\n"
-                f"Received: {tool_name}"
+                "MLMGroupAggregator accepts metadata from:\n"
+                "  - RoBERTaMaskedLanguageModelVerbs\n"
+                "  - MLMGroupAggregator\n"
+                "Received: {tool_name}"
             )
-        source_metadata = metadata.get("source_metadata")
         
-        # Check version compatibility
-        check_aggregator_version_compatibility(metadata, logger)
+        metadata = raw_metadata
+        source_metadata = raw_metadata.get("source_metadata")
         
         # Extract and apply settings from loaded metadata
         settings = metadata.get("settings", {})
         
-        # Apply settings based on tool type
-        if tool_name in ["MLMGroupAggregator", "RoBERTaMaskedLanguageModelVerbs"]:
-            if not args.top_k or args.top_k <= 0:
-                args.top_k = settings.get("top_k", 0)
-            if args.lemma_col == "lemma":
-                args.lemma_col = settings.get("lemma_col", "lemma")
-            if not args.short:
-                args.short = settings.get("short", False)
-            if not args.include_count:
-                args.include_count = settings.get("include_count", False)
+        # Apply settings from metadata
+        if not args.top_k or args.top_k <= 0:
+            args.top_k = settings.get("top_k", 0)
+        if args.lemma_col == "lemma":
+            args.lemma_col = settings.get("lemma_col", "lemma")
+        if not args.short:
+            args.short = settings.get("short", False)
+        if not args.include_count:
+            args.include_count = settings.get("include_count", False)
         
-        # Infer input CSV path based on tool type
-        if tool_name == "RoBERTaMaskedLanguageModelVerbs" and args.mlm_csv is None:
-            args.mlm_csv = metadata.get("output_file")
+        # Infer input file paths based on tool type
+        if tool_name == "RoBERTaMaskedLanguageModelVerbs":
+            if args.mlm_csv is None:
+                args.mlm_csv = metadata.get("output_file")
+        elif tool_name == "MLMGroupAggregator":
+            input_files = metadata.get("input_files", {})
+            if args.mlm_csv is None:
+                args.mlm_csv = input_files.get("mlm_csv")
+            if args.group_csv is None:
+                args.group_csv = input_files.get("group_csv")
     
     mlm_path = Path(args.mlm_csv)
     group_path = Path(args.group_csv)
