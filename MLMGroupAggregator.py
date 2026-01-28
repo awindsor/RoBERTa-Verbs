@@ -340,7 +340,7 @@ def run_cli() -> None:
     ap.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     ap.add_argument(
         "--load-metadata",
-        help="Load settings from metadata JSON (MLMGroupAggregator.json or RoBERTaMaskedLanguageModelVerbs.json)"
+        help="Load settings from metadata JSON (RoBERTaMaskedLanguageModelVerbs.json or MLMGroupAggregator.json)"
     )
     args = ap.parse_args()
     
@@ -370,7 +370,16 @@ def run_cli() -> None:
         tool_name = raw_metadata.get("tool", "unknown")
         logger.info(f"This metadata is from '{tool_name}'")
         
-        metadata = raw_metadata
+        # Validate tool type
+        supported_tools = ["RoBERTaMaskedLanguageModelVerbs", "MLMGroupAggregator"]
+        if tool_name not in supported_tools:
+            raise SystemExit(
+                f"Unsupported metadata source: '{tool_name}'\n"
+                f"MLMGroupAggregator accepts metadata from:\n"
+                f"  - RoBERTaMaskedLanguageModelVerbs\n"
+                f"  - MLMGroupAggregator\n"
+                f"Received: {tool_name}"
+            )
         source_metadata = metadata.get("source_metadata")
         
         # Check version compatibility
@@ -392,9 +401,6 @@ def run_cli() -> None:
         
         # Infer input CSV path based on tool type
         if tool_name == "RoBERTaMaskedLanguageModelVerbs" and args.mlm_csv is None:
-            args.mlm_csv = metadata.get("output_file")
-        elif tool_name == "SpaCyVerbExtractor" and args.mlm_csv is None:
-            # Use SpaCyVerbExtractor output as MLM CSV input
             args.mlm_csv = metadata.get("output_file")
     
     mlm_path = Path(args.mlm_csv)
@@ -1188,7 +1194,19 @@ def run_gui() -> None:
                 settings = metadata.get("settings", {})
                 input_files = metadata.get("input_files", {})
                 
-                # Handle RoBERTaMaskedLanguageModelVerbs metadata
+                # Validate tool type
+                supported_tools = ["RoBERTaMaskedLanguageModelVerbs", "MLMGroupAggregator"]
+                if tool not in supported_tools:
+                    QMessageBox.critical(
+                        self,
+                        "Unsupported Metadata Source",
+                        f"This metadata is from '{tool}' which is not supported.\n\n"
+                        f"MLMGroupAggregator accepts metadata from:\n"
+                        f"  • RoBERTaMaskedLanguageModelVerbs\n"
+                        f"  • MLMGroupAggregator\n\n"
+                        f"Received: {tool}"
+                    )
+                    return
                 if tool == "RoBERTaMaskedLanguageModelVerbs":
                     if input_files.get("mlm_csv"):
                         self.mlm_input.setText(input_files["mlm_csv"])
@@ -1211,17 +1229,6 @@ def run_gui() -> None:
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
                     self.short_check.setChecked(settings.get("short", False))
                     self.count_check.setChecked(settings.get("include_count", False))
-                # Handle SpaCyVerbExtractor metadata - use as MLM CSV input
-                elif tool == "SpaCyVerbExtractor":
-                    self.mlm_input.setText(metadata.get("output_file", ""))
-                    if metadata.get("output_file"):
-                        # Suggest a new output next to the input
-                        out_path = Path(metadata.get("output_file")).with_name("aggregated_output.csv")
-                        self.output_input.setText(str(out_path))
-                    # User must provide group CSV
-                else:
-                    QMessageBox.warning(self, "Unknown Metadata", f"This metadata is from '{tool}'.\nExpected RoBERTaMaskedLanguageModelVerbs, MLMGroupAggregator, or SpaCyVerbExtractor.")
-                    return
                 
                 self.log(f"✓ Loaded settings from: {json_path}")
             except Exception as e:
