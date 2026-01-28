@@ -39,8 +39,10 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
@@ -242,11 +244,13 @@ def load_spacy_model(model_name: str, logger=None):
         if "Can't find model" in str(e) or "No such file or directory" in str(e):
             if logger:
                 logger.info(f"Model '{model_name}' not found locally. Downloading...")
+
+            # Prefer the current interpreter; fall back to python3 if needed
+            py_exec = sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
             
-            # Download the model
             try:
                 result = subprocess.run(
-                    [sys.executable, "-m", "spacy", "download", model_name],
+                    [py_exec, "-m", "spacy", "download", model_name],
                     capture_output=True,
                     text=True,
                     timeout=300
@@ -515,7 +519,8 @@ def run_cli() -> None:
     # Enable only components needed for verb extraction (tagger, parser, lemmatizer, etc.)
     # This is more reliable than disabling specific components
     components_to_enable = [
-        c for c in ["tok2vec", "tagger", "parser", "senter", "attribute_ruler", "lemmatizer"]
+        c
+        for c in ["transformer", "tok2vec", "tagger", "parser", "senter", "attribute_ruler", "lemmatizer"]
         if c in nlp.pipe_names
     ]
     if components_to_enable:
@@ -567,6 +572,7 @@ def run_cli() -> None:
         overall_sents = 0
         overall_verbs = 0
         overall_start = time.time()
+        inaccessible_files = []  # Track files that couldn't be accessed
 
         for doc_path in paths:
             overall_docs += 1
@@ -580,6 +586,14 @@ def run_cli() -> None:
             sent_counter = 0
             verb_counter = 0
             chunk_counter = 0
+            
+            try:
+                # Test file accessibility before processing
+                _ = doc_path.stat()
+            except (PermissionError, OSError) as e:
+                logger.error(f"✗ Error: {e}")
+                inaccessible_files.append((str(doc_path), str(e)))
+                continue
             
             # Determine if this is a CSV file or text file
             is_csv = doc_path.suffix.lower() == '.csv' and args.csv_text_column
@@ -754,7 +768,7 @@ def run_cli() -> None:
                                         tok_i,
                                         tok.lemma_,
                                         tok.text.lower(),
-                                        f"{start_in_sent}:{end_in_sent}",
+                                        f"{start_in_sent}-{end_in_sent}",
                                         sent_text,
                                     ])
                             
@@ -813,7 +827,7 @@ def run_cli() -> None:
                                     tok_i,
                                     tok.lemma_,
                                     tok.text.lower(),
-                                    f"{start_in_sent}:{end_in_sent}",
+                                    f"{start_in_sent}-{end_in_sent}",
                                     sent_text,
                                 ])
                         
@@ -840,6 +854,14 @@ def run_cli() -> None:
             f"{overall_chunks:,} chunks | {overall_sents:,} sentences | {overall_verbs:,} verbs | "
             f"{elapsed_all:,.1f}s total"
         )
+        
+        if inaccessible_files:
+            logger.warning(
+                f"\n⚠ {len(inaccessible_files)} file(s) could not be accessed (permission/lock issues):"
+            )
+            for file_path, error_msg in inaccessible_files:
+                logger.warning(f"   {file_path}")
+                logger.warning(f"      Error: {error_msg}")
     
     except KeyboardInterrupt:
         stopped_by_user = True
@@ -1035,7 +1057,7 @@ def run_gui() -> None:
                             tok_i,
                             tok.lemma_,
                             tok.text.lower(),
-                            f"{start_in_sent}:{end_in_sent}",
+                            f"{start_in_sent}-{end_in_sent}",
                             sent_text,
                         ])
                 
@@ -1059,7 +1081,8 @@ def run_gui() -> None:
                 # Enable only components needed for verb extraction (tagger, parser, lemmatizer, etc.)
                 # This is more reliable than disabling specific components
                 components_to_enable = [
-                    c for c in ["tok2vec", "tagger", "parser", "senter", "attribute_ruler", "lemmatizer"]
+                    c
+                    for c in ["transformer", "tok2vec", "tagger", "parser", "senter", "attribute_ruler", "lemmatizer"]
                     if c in nlp.pipe_names
                 ]
                 if components_to_enable:
@@ -1108,6 +1131,13 @@ def run_gui() -> None:
                         
                         if not doc_path.exists():
                             self.progress_update.emit(f"⚠ Skipping missing path: {doc_path}")
+                            continue
+                        
+                        try:
+                            # Test file accessibility before processing
+                            _ = doc_path.stat()
+                        except (PermissionError, OSError) as e:
+                            self.progress_update.emit(f"✗ Error: {e}")
                             continue
                         
                         overall_docs += 1

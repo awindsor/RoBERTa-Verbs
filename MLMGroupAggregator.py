@@ -126,7 +126,7 @@ def save_aggregation_metadata(
             "lemma_col": settings.get("lemma_col", "lemma"),
             "short": settings.get("short", False),
             "include_count": settings.get("include_count", False),
-            "encoding": settings.get("encoding", "utf-8"),
+            "encoding": settings.get("encoding", "utf-8-sig"),
         },
         "statistics": stats,
     }
@@ -335,7 +335,7 @@ def run_cli() -> None:
     ap.add_argument("--lemma-col", default="lemma", help="Lemma column name (default: lemma)")
     ap.add_argument("--short", action="store_true", help="Output only lemma + group columns")
     ap.add_argument("--include-count", action="store_true", help="With --short, include per-lemma count")
-    ap.add_argument("--encoding", default="utf-8", help="CSV encoding (default: utf-8)")
+    ap.add_argument("--encoding", default="utf-8-sig", help="CSV encoding (default: utf-8-sig)")
     ap.add_argument("--log-every", type=int, default=100000, help="Log progress every N rows")
     ap.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     ap.add_argument(
@@ -413,7 +413,7 @@ def run_cli() -> None:
             logger.warning(msg)
     
     start_time = time.time()
-    group_labels, lemma_to_groups = load_groups_csv(args.group_csv, args.encoding, logger)
+    group_labels, lemma_to_groups = load_groups_csv(args.group_csv, "utf-8-sig", logger)
     
     processed = 0
     skipped = 0
@@ -748,7 +748,7 @@ def run_gui() -> None:
                 
                 group_labels, lemma_to_groups = load_groups_csv(
                     str(self.group_csv_path),
-                    self.encoding,
+                    "utf-8-sig",
                     logger,
                 )
                 
@@ -1299,7 +1299,7 @@ def run_gui() -> None:
                 self.lemma_col_input.text(),
                 self.short_check.isChecked(),
                 self.count_check.isChecked(),
-                "utf-8",
+                "utf-8-sig",
             )
             
             self.worker.progress_update.connect(self.log)

@@ -7,7 +7,7 @@ Supports both CLI and GUI modes:
   - Run with arguments: uses CLI mode
 
 For each row:
-  - read sentence + span_in_sentence_char (format "start:end")
+  - read sentence + span_in_sentence_char (format "start-end")
   - replace that character span with RoBERTa's mask token (<mask>)
   - run masked language model inference
   - write the original row plus 2*top_k new columns:
@@ -142,7 +142,7 @@ def save_mlm_metadata(
     metadata = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "tool": "RoBERTaMaskedLanguageModelVerbs",
-        "versions": get_mlm_version_info(model_name),
+        "versions": get_mlm_version_info(settings["model"]),
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "output_file": str(output_path),
@@ -191,8 +191,8 @@ def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
 # ============================================================================
 
 def parse_span(span_str: str) -> Tuple[int, int]:
-    # expected "start:end"
-    a, b = span_str.split(":")
+    # expected "start-end"
+    a, b = span_str.split("-")
     start = int(a)
     end = int(b)
     if start < 0 or end < 0 or end < start:
@@ -257,7 +257,7 @@ def topk_for_batch(
 
         row: List[Tuple[str, float]] = []
         for pid, p in zip(top_ids.tolist(), top_probs.tolist()):
-            row.append((decode_token(tokenizer, pid), float(p)))
+            row.append((decode_token(tokenizer, pid).lower(), float(p)))
         results.append(row)
 
     return results
