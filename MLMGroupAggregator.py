@@ -828,7 +828,7 @@ def run_gui() -> None:
                             try:
                                 lemma = (row.get(self.lemma_col) or "").strip()
                                 if not lemma:
-                                    raise ValueError(f"Empty lemma")
+                                    raise ValueError("Empty lemma")
 
                                 group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
 
@@ -890,7 +890,7 @@ def run_gui() -> None:
                                 try:
                                     lemma = (row.get(self.lemma_col) or "").strip()
                                     if not lemma:
-                                        raise ValueError(f"Empty lemma")
+                                        raise ValueError("Empty lemma")
 
                                     group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
 

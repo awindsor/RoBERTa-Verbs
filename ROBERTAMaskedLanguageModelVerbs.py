@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, List, Tuple, Optional, Set
 
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
@@ -163,7 +163,7 @@ def save_mlm_metadata(
         json.dump(metadata, f, indent=2)
 
 
-def load_mlm_metadata(json_path: Path) -> Dict:
+def load_mlm_metadata(json_path: Path) -> Any:
     """Load MLM metadata from JSON file."""
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -212,7 +212,8 @@ def mask_sentence(sentence: str, span_str: str, mask_token: str) -> str:
 
 def decode_token(tokenizer, token_id: int) -> str:
     # For RoBERTa, decoding a single token id may include a leading space.
-    return tokenizer.decode([token_id], clean_up_tokenization_spaces=False).strip()
+    decoded: str = tokenizer.decode([token_id], clean_up_tokenization_spaces=False).strip()
+    return decoded
 
 
 def topk_for_batch(
@@ -295,6 +296,14 @@ def run_cli() -> None:
     ap.add_argument("--load-metadata", help="Load settings from metadata JSON (CLI args override)")
     args = ap.parse_args()
 
+    # Set up logging first, before using logger
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger("mlm")
+
     # Load metadata if provided
     metadata = None
     source_metadata = None  # Store the source metadata for chaining
@@ -347,13 +356,6 @@ def run_cli() -> None:
     if not args.input_csv or not args.output_csv:
         ap.print_help()
         raise SystemExit("Error: input_csv and output_csv are required (or use --load-metadata)")
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logger = logging.getLogger("mlm")
     
     # Log metadata source if loaded
     if metadata:
@@ -431,109 +433,108 @@ def run_cli() -> None:
     try:
         with open(args.input_csv, newline="", encoding=args.encoding) as fin, \
              open(args.output_csv, "w", newline="", encoding=args.encoding) as fout:
-        reader = csv.DictReader(fin)
-        if reader.fieldnames is None:
-            raise SystemExit("Input CSV has no header.")
+            reader = csv.DictReader(fin)
+            if reader.fieldnames is None:
+                raise SystemExit("Input CSV has no header.")
 
-        missing = needed_cols - set(reader.fieldnames)
-        if missing:
-            raise SystemExit(f"Input CSV missing required columns: {sorted(missing)}")
+            missing = needed_cols - set(reader.fieldnames)
+            if missing:
+                raise SystemExit(f"Input CSV missing required columns: {sorted(missing)}")
 
-        out_fieldnames = list(reader.fieldnames) + pred_cols
-        writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
-        writer.writeheader()
+            out_fieldnames = list(reader.fieldnames) + pred_cols
+            writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
+            writer.writeheader()
 
-        def flush_batch(batch: List[PendingRow]) -> None:
-            nonlocal processed
-            texts = [pr.masked_text for pr in batch]
-
-            if logger.isEnabledFor(logging.DEBUG):
-                for i, t in enumerate(texts[: min(len(texts), 5)], start=1):
-                    logger.debug(f"Masked[{i}/{len(texts)}]: {t}")
-
-            preds = topk_for_batch(model, tokenizer, texts, args.top_k, dev)
-
-            for pr, pr_preds in zip(batch, preds):
-                out_row = dict(pr.row)
-
-                # write top-k token/prob
-                for j, (tok, prob) in enumerate(pr_preds, start=1):
-                    out_row[f"token_{j}"] = tok
-                    out_row[f"prob_{j}"] = f"{prob:.10g}"
-
-                writer.writerow(out_row)
-                processed += 1
-
-        for row_idx, row in enumerate(reader, start=1):
-            seen += 1
-
-            if args.debug_limit and (processed + skipped) >= args.debug_limit:
-                logger.info(f"Debug limit reached ({args.debug_limit}); stopping early.")
-                break
-
-            try:
-                raw_sent = row["sentence"]
-                span = row["span_in_sentence_char"]
-
-                masked_raw = mask_sentence(raw_sent, span, mask_token)
-                masked = " " + masked_raw.strip()
+            def flush_batch(batch: List[PendingRow]) -> None:
+                nonlocal processed
+                texts = [pr.masked_text for pr in batch]
 
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Row {row_idx}: span={span} raw={raw_sent!r}")
-                    logger.debug(f"Row {row_idx}: masked={masked!r}")
+                    for i, t in enumerate(texts[: min(len(texts), 5)], start=1):
+                        logger.debug(f"Masked[{i}/{len(texts)}]: {t}")
 
-                pending.append(PendingRow(row=row, masked_text=masked))
+                preds = topk_for_batch(model, tokenizer, texts, args.top_k, dev)
 
-            except Exception as e:
-                skipped += 1
-                if skipped <= 10:
-                    logger.warning(f"Skipping row {row_idx} due to error: {e}")
-                maybe_log_progress()
-                continue
+                for pr, pr_preds in zip(batch, preds):
+                    out_row = dict(pr.row)
 
-            if len(pending) >= args.batch_size:
+                    # write top-k token/prob
+                    for j, (tok, prob) in enumerate(pr_preds, start=1):
+                        out_row[f"token_{j}"] = tok
+                        out_row[f"prob_{j}"] = f"{prob:.10g}"
+
+                    writer.writerow(out_row)
+                    processed += 1
+
+            for row_idx, row in enumerate(reader, start=1):
+                seen += 1
+
+                if args.debug_limit and (processed + skipped) >= args.debug_limit:
+                    logger.info(f"Debug limit reached ({args.debug_limit}); stopping early.")
+                    break
+
+                try:
+                    raw_sent = row["sentence"]
+                    span = row["span_in_sentence_char"]
+
+                    masked_raw = mask_sentence(raw_sent, span, mask_token)
+                    masked = " " + masked_raw.strip()
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Row {row_idx}: span={span} raw={raw_sent!r}")
+                        logger.debug(f"Row {row_idx}: masked={masked!r}")
+
+                    pending.append(PendingRow(row=row, masked_text=masked))
+
+                except Exception as e:
+                    skipped += 1
+                    if skipped <= 10:
+                        logger.warning(f"Skipping row {row_idx} due to error: {e}")
+                    maybe_log_progress()
+                    continue
+
+                if len(pending) >= args.batch_size:
+                    flush_batch(pending)
+                    pending.clear()
+                    maybe_log_progress()
+                else:
+                    maybe_log_progress()
+
+            if pending and (not args.debug_limit or (processed + skipped) < args.debug_limit):
                 flush_batch(pending)
                 pending.clear()
-                maybe_log_progress()
 
-            else:
-                maybe_log_progress()
+            maybe_log_progress(force=True)
 
-        if pending and (not args.debug_limit or (processed + skipped) < args.debug_limit):
-            flush_batch(pending)
-            pending.clear()
+        elapsed_time = time.time() - start_time
+        
+        # Compute checksums and save metadata
+        input_checksum = compute_file_md5(input_path)
+        output_checksum = compute_file_md5(output_path)
+        
+        mlm_settings = {
+            "model": args.model,
+            "batch_size": args.batch_size,
+            "top_k": args.top_k,
+            "device": str(dev),
+            "encoding": args.encoding,
+            "debug_limit": args.debug_limit if args.debug_limit else None,
+        }
+        
+        stats = {
+            "rows_seen": seen,
+            "rows_written": processed,
+            "rows_skipped": skipped,
+            "elapsed_seconds": round(elapsed_time, 2),
+        }
+        
+        command = reconstruct_mlm_command(args.input_csv, args.output_csv, args)
+        
+        save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata, command)
 
-        maybe_log_progress(force=True)
-
-    elapsed_time = time.time() - start_time
-    
-    # Compute checksums and save metadata
-    input_checksum = compute_file_md5(input_path)
-    output_checksum = compute_file_md5(output_path)
-    
-    mlm_settings = {
-        "model": args.model,
-        "batch_size": args.batch_size,
-        "top_k": args.top_k,
-        "device": str(dev),
-        "encoding": args.encoding,
-        "debug_limit": args.debug_limit if args.debug_limit else None,
-    }
-    
-    stats = {
-        "rows_seen": seen,
-        "rows_written": processed,
-        "rows_skipped": skipped,
-        "elapsed_seconds": round(elapsed_time, 2),
-    }
-    
-    command = reconstruct_mlm_command(args.input_csv, args.output_csv, args)
-    
-    save_mlm_metadata(output_path, input_path, input_checksum, output_checksum, mlm_settings, stats, source_metadata, command)
-
-    logger.info(f"Done. Written={processed:,} skipped={skipped:,} time={elapsed_time:.1f}s output={args.output_csv}")
-    logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
-    
+        logger.info(f"Done. Written={processed:,} skipped={skipped:,} time={elapsed_time:.1f}s output={args.output_csv}")
+        logger.info(f"✓ Saved metadata to {output_path.with_suffix('.json')}")
+        
     except KeyboardInterrupt:
         logger.info("\nCancellation requested. Saving incomplete results...")
         elapsed_time = time.time() - start_time
@@ -590,6 +591,7 @@ def run_gui() -> None:
             QTextEdit,
             QMessageBox,
             QCheckBox,
+            QProgressBar,
         )
     except ImportError:
         print("Error: PySide6 is required for GUI mode.")
@@ -1114,7 +1116,7 @@ def run_gui() -> None:
                         reply = QMessageBox.warning(self, "Checksum Mismatch", msg, QMessageBox.Yes | QMessageBox.No)
                         if reply == QMessageBox.No:
                             return
-                except:
+                except Exception:
                     pass
             
             # Clear log

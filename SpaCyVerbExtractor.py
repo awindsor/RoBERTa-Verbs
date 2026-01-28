@@ -39,13 +39,13 @@ import csv
 import hashlib
 import json
 import logging
-import os
 import sys
 import time
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import spacy
 
@@ -95,8 +95,8 @@ def save_run_metadata(
     input_paths: List[Path],
     input_checksums: Dict[str, str],
     output_checksum: str,
-    args: Dict[str, any],
-    stats: Dict[str, any],
+    args: Dict[str, Any],
+    stats: Dict[str, Any],
     status: str = "completed",
     command: Optional[str] = None,
 ) -> None:
@@ -137,13 +137,13 @@ def save_run_metadata(
         json.dump(metadata, f, indent=2)
 
 
-def load_run_metadata(json_path: Path) -> Dict:
+def load_run_metadata(json_path: Path) -> Any:
     """Load extraction metadata from JSON file."""
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def verify_input_file_checksums(input_paths: List[Path], metadata: Dict) -> Dict[str, str]:
+def verify_input_file_checksums(input_paths: List[Path], metadata: Dict) -> Dict[str, List[str]]:
     """
     Verify input file checksums against metadata.
     
@@ -154,7 +154,7 @@ def verify_input_file_checksums(input_paths: List[Path], metadata: Dict) -> Dict
     }
     """
     input_checksums = metadata.get("input_checksums", {})
-    issues = {"missing_files": [], "checksum_mismatches": []}
+    issues: Dict[str, List[str]] = {"missing_files": [], "checksum_mismatches": []}
     
     for file_path in input_paths:
         file_path_str = str(file_path)
@@ -231,8 +231,6 @@ def load_spacy_model(model_name: str, logger=None):
     Raises:
         OSError: If model download fails
     """
-    import subprocess
-    
     try:
         # Try to load the model directly
         if logger:
@@ -567,171 +565,225 @@ def run_cli() -> None:
             
             writer.writerow(header)
 
-        overall_docs = 0
-        overall_chunks = 0
-        overall_sents = 0
-        overall_verbs = 0
-        overall_start = time.time()
-        inaccessible_files = []  # Track files that couldn't be accessed
+            inaccessible_files = []  # Track files that couldn't be accessed
 
-        for doc_path in paths:
-            overall_docs += 1
-            if not doc_path.exists():
-                logger.warning(f"Skipping missing path: {doc_path}")
-                continue
+            for doc_path in paths:
+                overall_docs += 1
+                if not doc_path.exists():
+                    logger.warning(f"Skipping missing path: {doc_path}")
+                    continue
 
-            logger.info(f"Starting document: {doc_path}")
+                logger.info(f"Starting document: {doc_path}")
 
-            doc_start = time.time()
-            sent_counter = 0
-            verb_counter = 0
-            chunk_counter = 0
-            
-            try:
-                # Test file accessibility before processing
-                _ = doc_path.stat()
-            except (PermissionError, OSError) as e:
-                logger.error(f"✗ Error: {e}")
-                inaccessible_files.append((str(doc_path), str(e)))
-                continue
-            
-            # Determine if this is a CSV file or text file
-            is_csv = doc_path.suffix.lower() == '.csv' and args.csv_text_column
-            
-            if is_csv:
-                # Process as CSV file with batch processing using nlp.pipe()
-                seen_csv_rows: Dict[Tuple[int, str], int] = {}  # (csv_row_num, sent_text) -> sent_index
-                order_csv = []
+                doc_start = time.time()
+                sent_counter = 0
+                verb_counter = 0
+                chunk_counter = 0
                 
-                # Collect all rows for batch processing
-                csv_rows_list = []
-                for csv_row_num, text_to_process, other_fields in stream_csv_rows(
-                    doc_path,
-                    text_column=args.csv_text_column,
-                    encoding=args.encoding,
-                ):
-                    if text_to_process.strip():
-                        # Create metadata dict for this row
-                        metadata = {
-                            "csv_row_num": csv_row_num,
-                            "csv_fields": other_fields if args.include_csv_fields else None,
-                        }
-                        csv_rows_list.append((text_to_process, metadata))
+                try:
+                    # Test file accessibility before processing
+                    _ = doc_path.stat()
+                except (PermissionError, OSError) as e:
+                    logger.error(f"✗ Error: {e}")
+                    inaccessible_files.append((str(doc_path), str(e)))
+                    continue
                 
-                # Process all rows in batches using nlp.pipe() with metadata
-                batch_size = 32
-                for batch_idx in range(0, len(csv_rows_list), batch_size):
-                    batch = csv_rows_list[batch_idx:batch_idx + batch_size]
+                # Determine if this is a CSV file or text file
+                is_csv = doc_path.suffix.lower() == '.csv' and args.csv_text_column
+                
+                if is_csv:
+                    # Process as CSV file with batch processing using nlp.pipe()
+                    seen_csv_rows: Dict[Tuple[int, str], int] = {}  # (csv_row_num, sent_text) -> sent_index
+                    order_csv = []
                     
-                    for doc in nlp.pipe(batch, as_tuples=True):
-                        chunk_counter += 1
-                        overall_chunks += 1
+                    # Collect all rows for batch processing
+                    csv_rows_list = []
+                    for csv_row_num, text_to_process, other_fields in stream_csv_rows(
+                        doc_path,
+                        text_column=args.csv_text_column,
+                        encoding=args.encoding,
+                    ):
+                        if text_to_process.strip():
+                            # Create metadata dict for this row
+                            metadata = {
+                                "csv_row_num": csv_row_num,
+                                "csv_fields": other_fields if args.include_csv_fields else None,
+                            }
+                            csv_rows_list.append((text_to_process, metadata))
+                    
+                    # Process all rows in batches using nlp.pipe() with metadata
+                    batch_size = 32
+                    for batch_idx in range(0, len(csv_rows_list), batch_size):
+                        batch = csv_rows_list[batch_idx:batch_idx + batch_size]
                         
-                        metadata = doc.user_data
-                        csv_row_num = metadata.get("csv_row_num")
-                        csv_fields = metadata.get("csv_fields")
-                        
-                        for sent in doc.sents:
-                            key = (csv_row_num, sent.text)
+                        for doc in nlp.pipe(batch, as_tuples=True):
+                            chunk_counter += 1
+                            overall_chunks += 1
                             
-                            if key in seen_csv_rows:
-                                continue
+                            metadata = doc.user_data
+                            csv_row_from_metadata: int = metadata.get("csv_row_num", 0) or 0
+                            csv_fields = metadata.get("csv_fields")
                             
-                            seen_csv_rows[key] = sent_counter
-                            order_csv.append(key)
-                            sent_counter += 1
-                            
-                            if len(order_csv) > args.dedupe_window:
-                                drop_n = max(1, args.dedupe_window // 10)
-                                for _ in range(drop_n):
-                                    old = order_csv.pop(0)
-                                    seen_csv_rows.pop(old, None)
-                            
-                            sent_text = sent.text
-                            
-                            for tok_i, tok in enumerate(sent):
-                                is_verb = tok.pos_ == "VERB" or (args.include_aux and tok.pos_ == "AUX")
-                                if not is_verb:
+                            for sent in doc.sents:
+                                key = (csv_row_from_metadata, sent.text)
+                                
+                                if key in seen_csv_rows:
                                     continue
                                 
-                                verb_counter += 1
-                                start_in_sent = tok.idx - sent.start_char
-                                end_in_sent = start_in_sent + len(tok.text)
+                                seen_csv_rows[key] = sent_counter
+                                order_csv.append(key)
+                                sent_counter += 1
                                 
-                                row = [
-                                    str(doc_path),
-                                    csv_row_num,  # csv_row_number column
-                                    0,  # chunk_start_char (not applicable for CSV)
-                                    0,  # sent_start_char_in_doc (not applicable for CSV)
-                                    seen_csv_rows[key],
-                                    tok_i,
-                                    tok.lemma_,
-                                    tok.text.lower(),
-                                    f"{start_in_sent}:{end_in_sent}",
-                                    sent_text,
-                                ]
+                                if len(order_csv) > args.dedupe_window:
+                                    drop_n = max(1, args.dedupe_window // 10)
+                                    for _ in range(drop_n):
+                                        old = order_csv.pop(0)
+                                        seen_csv_rows.pop(old, None)
                                 
-                                # Add CSV fields if requested
-                                if args.include_csv_fields and csv_fields:
-                                    row.extend(csv_fields.values())
+                                sent_text = sent.text
                                 
-                                writer.writerow(row)
+                                for tok_i, tok in enumerate(sent):
+                                    is_verb = tok.pos_ == "VERB" or (args.include_aux and tok.pos_ == "AUX")
+                                    if not is_verb:
+                                        continue
+                                    
+                                    verb_counter += 1
+                                    start_in_sent = tok.idx - sent.start_char
+                                    end_in_sent = start_in_sent + len(tok.text)
+                                    
+                                    row = [
+                                        str(doc_path),
+                                        csv_row_from_metadata,  # csv_row_number column
+                                        0,  # chunk_start_char (not applicable for CSV)
+                                        0,  # sent_start_char_in_doc (not applicable for CSV)
+                                        seen_csv_rows[key],
+                                        tok_i,
+                                        tok.lemma_,
+                                        tok.text.lower(),
+                                        f"{start_in_sent}:{end_in_sent}",
+                                        sent_text,
+                                    ]
+                                    
+                                    # Add CSV fields if requested
+                                    if args.include_csv_fields and csv_fields:
+                                        row.extend(csv_fields.values())
+                                    
+                                    writer.writerow(row)
+                            
+                            if args.heartbeat_chunks > 0 and (chunk_counter % args.heartbeat_chunks == 0):
+                                elapsed = time.time() - doc_start
+                                logger.info(
+                                    f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs | {elapsed:,.1f}s elapsed"
+                                )
+                else:
+                    # Process as text file with batch processing using nlp.pipe()
+                    try:
+                        file_size_bytes = doc_path.stat().st_size
+                    except OSError:
+                        file_size_bytes = 0
+                    
+                    seen: Dict[Tuple[int, str], int] = {}
+                    order: List[Tuple[int, str]] = []
+                    
+                    # Collect chunks for batch processing
+                    chunk_batch: List[Tuple[str, Dict[str, int]]] = []
+                    batch_size = 32
+                    
+                    for chunk_start, chunk_text in stream_char_chunks(
+                        doc_path,
+                        encoding=args.encoding,
+                        chunk_size=args.chunk_size,
+                        overlap=args.overlap,
+                    ):
+                        chunk_end = chunk_start + len(chunk_text)
                         
-                        if args.heartbeat_chunks > 0 and (chunk_counter % args.heartbeat_chunks == 0):
-                            elapsed = time.time() - doc_start
-                            logger.info(
-                                f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs | {elapsed:,.1f}s elapsed"
-                            )
-            else:
-                # Process as text file with batch processing using nlp.pipe()
-                try:
-                    file_size_bytes = doc_path.stat().st_size
-                except OSError:
-                    file_size_bytes = 0
-                
-                seen: Dict[Tuple[int, str], int] = {}
-                order: List[Tuple[int, str]] = []
-                
-                # Collect chunks for batch processing
-                chunk_batch = []
-                batch_size = 32
-                
-                for chunk_start, chunk_text in stream_char_chunks(
-                    doc_path,
-                    encoding=args.encoding,
-                    chunk_size=args.chunk_size,
-                    overlap=args.overlap,
-                ):
-                    chunk_end = chunk_start + len(chunk_text)
+                        if file_size_bytes > 0:
+                            pct = min(100.0, (chunk_end / file_size_bytes) * 100.0)
+                        else:
+                            pct = 0.0
+                        
+                        logger.info(
+                            f"  Chunk {chunk_counter + len(chunk_batch) + 1:6d} | chars {chunk_start:,}–{chunk_end:,} | ~{pct:6.2f}%"
+                        )
+                        
+                        # Store chunk with metadata for batch processing
+                        metadata = {
+                            "chunk_start": chunk_start,
+                            "chunk_end": chunk_end,
+                            "file_size_bytes": file_size_bytes,
+                        }
+                        chunk_batch.append((chunk_text, metadata))
+                        
+                        # Process batch when it reaches batch_size
+                        if len(chunk_batch) >= batch_size:
+                            for doc in nlp.pipe(chunk_batch, as_tuples=True):
+                                chunk_counter += 1
+                                overall_chunks += 1
+                                
+                                metadata = doc.user_data
+                                chunk_start_from_metadata: int = metadata.get("chunk_start", 0) or 0
+                                
+                                for sent in doc.sents:
+                                    sent_start_in_doc = chunk_start_from_metadata + sent.start_char
+                                    key = (sent_start_in_doc, sent.text)
+                                    
+                                    if key in seen:
+                                        continue
+                                    
+                                    seen[key] = sent_counter
+                                    order.append(key)
+                                    sent_counter += 1
+                                    
+                                    if len(order) > args.dedupe_window:
+                                        drop_n = max(1, args.dedupe_window // 10)
+                                        if args.log_level == "DEBUG":
+                                            logger.debug(f"Pruning dedupe cache: dropping {drop_n} oldest sentences")
+                                        for _ in range(drop_n):
+                                            old = order.pop(0)
+                                            seen.pop(old, None)
+                                    
+                                    sent_text = sent.text
+                                    
+                                    for tok_i, tok in enumerate(sent):
+                                        is_verb = tok.pos_ == "VERB" or (args.include_aux and tok.pos_ == "AUX")
+                                        if not is_verb:
+                                            continue
+                                        
+                                        verb_counter += 1
+                                        start_in_sent = tok.idx - sent.start_char
+                                        end_in_sent = start_in_sent + len(tok.text)
+                                        
+                                        writer.writerow([
+                                            str(doc_path),
+                                            chunk_start_from_metadata,
+                                            sent_start_in_doc,
+                                            seen[key],
+                                            tok_i,
+                                            tok.lemma_,
+                                            tok.text.lower(),
+                                            f"{start_in_sent}-{end_in_sent}",
+                                            sent_text,
+                                        ])
+                                
+                                if args.heartbeat_chunks > 0 and (chunk_counter % args.heartbeat_chunks == 0):
+                                    elapsed = time.time() - doc_start
+                                    logger.info(
+                                        f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs | {elapsed:,.1f}s elapsed"
+                                    )
+                            
+                            chunk_batch = []
                     
-                    if file_size_bytes > 0:
-                        pct = min(100.0, (chunk_end / file_size_bytes) * 100.0)
-                    else:
-                        pct = 0.0
-                    
-                    logger.info(
-                        f"  Chunk {chunk_counter + len(chunk_batch) + 1:6d} | chars {chunk_start:,}–{chunk_end:,} | ~{pct:6.2f}%"
-                    )
-                    
-                    # Store chunk with metadata for batch processing
-                    metadata = {
-                        "chunk_start": chunk_start,
-                        "chunk_end": chunk_end,
-                        "file_size_bytes": file_size_bytes,
-                    }
-                    chunk_batch.append((chunk_text, metadata))
-                    
-                    # Process batch when it reaches batch_size
-                    if len(chunk_batch) >= batch_size:
+                    # Process remaining chunks in final batch
+                    if chunk_batch:
                         for doc in nlp.pipe(chunk_batch, as_tuples=True):
                             chunk_counter += 1
                             overall_chunks += 1
                             
                             metadata = doc.user_data
-                            chunk_start = metadata.get("chunk_start")
+                            chunk_start_final: int = metadata.get("chunk_start", 0) or 0
                             
                             for sent in doc.sents:
-                                sent_start_in_doc = chunk_start + sent.start_char
+                                sent_start_in_doc = chunk_start_final + sent.start_char
                                 key = (sent_start_in_doc, sent.text)
                                 
                                 if key in seen:
@@ -762,7 +814,7 @@ def run_cli() -> None:
                                     
                                     writer.writerow([
                                         str(doc_path),
-                                        chunk_start,
+                                        chunk_start_final,
                                         sent_start_in_doc,
                                         seen[key],
                                         tok_i,
@@ -777,75 +829,16 @@ def run_cli() -> None:
                                 logger.info(
                                     f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs | {elapsed:,.1f}s elapsed"
                                 )
-                        
-                        chunk_batch = []
-                
-                # Process remaining chunks in final batch
-                if chunk_batch:
-                    for doc in nlp.pipe(chunk_batch, as_tuples=True):
-                        chunk_counter += 1
-                        overall_chunks += 1
-                        
-                        metadata = doc.user_data
-                        chunk_start = metadata.get("chunk_start")
-                        
-                        for sent in doc.sents:
-                            sent_start_in_doc = chunk_start + sent.start_char
-                            key = (sent_start_in_doc, sent.text)
-                            
-                            if key in seen:
-                                continue
-                            
-                            seen[key] = sent_counter
-                            order.append(key)
-                            sent_counter += 1
-                            
-                            if len(order) > args.dedupe_window:
-                                drop_n = max(1, args.dedupe_window // 10)
-                                if args.log_level == "DEBUG":
-                                    logger.debug(f"Pruning dedupe cache: dropping {drop_n} oldest sentences")
-                                for _ in range(drop_n):
-                                    old = order.pop(0)
-                                    seen.pop(old, None)
-                            
-                            sent_text = sent.text
-                            
-                            for tok_i, tok in enumerate(sent):
-                                is_verb = tok.pos_ == "VERB" or (args.include_aux and tok.pos_ == "AUX")
-                                if not is_verb:
-                                    continue
-                                
-                                verb_counter += 1
-                                start_in_sent = tok.idx - sent.start_char
-                                end_in_sent = start_in_sent + len(tok.text)
-                                
-                                writer.writerow([
-                                    str(doc_path),
-                                    chunk_start,
-                                    sent_start_in_doc,
-                                    seen[key],
-                                    tok_i,
-                                    tok.lemma_,
-                                    tok.text.lower(),
-                                    f"{start_in_sent}-{end_in_sent}",
-                                    sent_text,
-                                ])
-                        
-                        if args.heartbeat_chunks > 0 and (chunk_counter % args.heartbeat_chunks == 0):
-                            elapsed = time.time() - doc_start
-                            logger.info(
-                                f"    Heartbeat: {sent_counter:,} sentences | {verb_counter:,} verbs | {elapsed:,.1f}s elapsed"
-                            )
 
-            elapsed_doc = time.time() - doc_start
-            overall_sents += sent_counter
-            overall_verbs += verb_counter
+                elapsed_doc = time.time() - doc_start
+                overall_sents += sent_counter
+                overall_verbs += verb_counter
 
-            logger.info(
-                f"Finished document: {doc_path} | "
-                f"{chunk_counter:,} chunks | {sent_counter:,} sentences | {verb_counter:,} verbs | "
-                f"{elapsed_doc:,.1f}s"
-            )
+                logger.info(
+                    f"Finished document: {doc_path} | "
+                    f"{chunk_counter:,} chunks | {sent_counter:,} sentences | {verb_counter:,} verbs | "
+                    f"{elapsed_doc:,.1f}s"
+                )
 
         elapsed_all = time.time() - overall_start
         logger.info(
@@ -867,7 +860,7 @@ def run_cli() -> None:
         stopped_by_user = True
         elapsed_all = time.time() - overall_start
         logger.warning("Extraction interrupted by user (Ctrl+C)")
-
+    
     # Compute checksums and save metadata
     logger.info("Computing file checksums...")
     input_checksums = {str(p): compute_file_md5(p) for p in paths if p.exists()}
@@ -979,11 +972,12 @@ def run_gui() -> None:
         
         def _format_bytes(self, num_bytes: int) -> str:
             """Format bytes as human-readable string (B, KB, MB, GB)."""
+            bytes_float: float = float(num_bytes)
             for unit in ['B', 'KB', 'MB', 'GB']:
-                if num_bytes < 1024.0:
-                    return f"{num_bytes:.1f} {unit}"
-                num_bytes /= 1024.0
-            return f"{num_bytes:.1f} TB"
+                if bytes_float < 1024.0:
+                    return f"{bytes_float:.1f} {unit}"
+                bytes_float /= 1024.0
+            return f"{bytes_float:.1f} TB"
         
         def _process_chunk_batch(self, nlp, chunk_batch, chunk_counter, overall_chunks,
                                  file_index, file_size_bytes, seen, order, 
