@@ -756,10 +756,12 @@ def run_gui() -> None:
                 self.progress_update.emit("")
 
                 # Determine total rows for progress bar (header excluded)
+                # Use CSV reader to count actual CSV rows, not just lines
                 total_rows = 0
                 try:
-                    with self.mlm_csv_path.open(encoding=self.encoding) as fin_count:
-                        total_rows = max(sum(1 for _ in fin_count) - 1, 0)
+                    with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin_count:
+                        count_reader = csv.DictReader(fin_count)
+                        total_rows = sum(1 for _ in count_reader)
                 except Exception:
                     total_rows = 0
 
@@ -930,7 +932,7 @@ def run_gui() -> None:
                 # Save metadata
                 self.progress_update.emit("Computing checksums and saving metadata...")
                 if total_rows:
-                    self.progress_value.emit(total_rows, total_rows)
+                    self.progress_value.emit(processed, processed)
                 mlm_checksum = compute_file_md5(self.mlm_csv_path)
                 group_checksum = compute_file_md5(self.group_csv_path)
                 output_checksum = compute_file_md5(self.output_csv_path)
@@ -1123,7 +1125,8 @@ def run_gui() -> None:
             progress_layout = QVBoxLayout()
             self.progress_bar = QProgressBar()
             self.progress_bar.setMinimum(0)
-            self.progress_bar.setMaximum(0)
+            self.progress_bar.setMaximum(1)
+            self.progress_bar.setValue(0)
             self.progress_bar.setTextVisible(True)
             progress_layout.addWidget(self.progress_bar)
             self.progress_label = QLabel("Ready")
@@ -1233,7 +1236,9 @@ def run_gui() -> None:
 
         def update_progress(self, processed: int, total: int):
             if total <= 0:
-                self.progress_bar.setMaximum(0)
+                # Keep progress bar in definite state to avoid animation
+                self.progress_bar.setMaximum(1)
+                self.progress_bar.setValue(0)
                 self.progress_label.setText("Processing...")
                 return
             self.progress_bar.setMaximum(total)
