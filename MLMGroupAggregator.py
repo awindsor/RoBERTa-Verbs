@@ -41,7 +41,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Set, Tuple, Optional, Sequence
 
 from lemminflect import getLemma
 import hashlib
@@ -83,8 +83,8 @@ def save_aggregation_metadata(
     mlm_checksum: str,
     group_checksum: str,
     output_checksum: str,
-    settings: Dict[str, any],
-    stats: Dict[str, any],
+    settings: Dict[str, Any],
+    stats: Dict[str, Any],
     group_labels: List[str],
     lemma_to_groups: Dict[str, Set[str]],
     source_metadata: Optional[Dict] = None,
@@ -139,13 +139,13 @@ def save_aggregation_metadata(
         json.dump(metadata, f, indent=2)
 
 
-def load_aggregation_metadata(json_path: Path) -> Dict:
+def load_aggregation_metadata(json_path: Path) -> Any:
     """Load aggregation metadata from JSON file."""
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_mlm_metadata(json_path: Path) -> Dict:
+def load_mlm_metadata(json_path: Path) -> Any:
     """Load MLM metadata from RoBERTaMaskedLanguageModelVerbs JSON."""
     with json_path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -285,7 +285,7 @@ def load_groups_csv(group_csv_path: str, encoding: str, logger: logging.Logger) 
     return group_labels, lemma_to_groups
 
 
-def infer_top_k(fieldnames: List[str]) -> int:
+def infer_top_k(fieldnames: Sequence[str]) -> int:
     """Infer top_k from fieldnames by counting prob_i columns."""
     max_k = 0
     for name in fieldnames:
@@ -300,7 +300,7 @@ def infer_top_k(fieldnames: List[str]) -> int:
     return max_k
 
 
-def build_group_output_columns(fieldnames: List[str], group_labels: List[str]) -> Tuple[List[str], Dict[str, str]]:
+def build_group_output_columns(fieldnames: Sequence[str], group_labels: List[str]) -> Tuple[List[str], Dict[str, str]]:
     """Create safe output column names for each group and a mapping from group->column.
 
     Ensures names don't collide with existing fieldnames by appending numeric suffixes if needed.
@@ -554,7 +554,7 @@ def run_cli() -> None:
                             if not lemma:
                                 raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
 
-                            group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+                            group_sums = {g: 0.0 for g in group_labels}
 
                             for i in range(1, k + 1):
                                 tok = row.get(f"token_{i}", "")
