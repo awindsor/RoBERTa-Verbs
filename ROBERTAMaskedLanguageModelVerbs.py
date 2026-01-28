@@ -737,6 +737,49 @@ def run_gui() -> None:
                 self.progress_update.emit(f"✓ Saved metadata: {self.output_path.with_suffix('.json')}")
                 self.finished.emit(True, f"MLM inference complete. Output: {self.output_path}")
                 
+            except ValueError as e:
+                # Handle stop request (user clicked stop button)
+                if "Stop requested" in str(e):
+                    self.progress_update.emit("Saving incomplete results...")
+                    elapsed_time = time.time() - start_time
+                    
+                    try:
+                        input_checksum = compute_file_md5(self.input_path)
+                        output_checksum = compute_file_md5(self.output_path) if self.output_path.exists() else ""
+                        
+                        mlm_settings = {
+                            "model": self.model_name,
+                            "batch_size": self.batch_size,
+                            "top_k": self.top_k,
+                            "device": str(dev),
+                            "debug_limit": self.debug_limit if self.debug_limit else None,
+                        }
+                        
+                        stats = {
+                            "rows_seen": seen,
+                            "rows_written": processed,
+                            "rows_skipped": skipped,
+                            "elapsed_seconds": round(elapsed_time, 2),
+                            "incomplete": True,
+                        }
+                        
+                        gui_command = (
+                            f"python RoBERTaMaskedLanguageModelVerbs.py {self.input_path} {self.output_path} "
+                            f"--model {self.model_name} --batch-size {self.batch_size} --top-k {self.top_k} "
+                            f"--device {dev}"
+                        )
+                        
+                        save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command)
+                        self.progress_update.emit(f"✓ Saved incomplete metadata: {self.output_path.with_suffix('.json')}")
+                    except Exception as meta_err:
+                        self.progress_update.emit(f"⚠ Failed to save metadata: {meta_err}")
+                    
+                    self.finished.emit(False, f"MLM inference stopped by user. Processed {processed:,} rows.")
+                else:
+                    # Other ValueError
+                    self.progress_update.emit(f"✗ Error: {str(e)}")
+                    self.finished.emit(False, f"Error: {str(e)}")
+                    
             except Exception as e:
                 self.progress_update.emit(f"✗ Error: {str(e)}")
                 self.finished.emit(False, f"Error: {str(e)}")
