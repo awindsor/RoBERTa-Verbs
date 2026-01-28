@@ -566,6 +566,7 @@ def run_gui() -> None:
         """Worker thread for MLM inference without blocking UI."""
         
         progress_update = Signal(str)
+        progress_bar_update = Signal(int, str)  # (percentage, row_info_text)
         finished = Signal(bool, str)
         
         def __init__(
@@ -627,6 +628,14 @@ def run_gui() -> None:
                 processed = 0
                 skipped = 0
                 seen = 0
+                
+                # Count total rows for progress bar
+                total_rows = 0
+                try:
+                    with self.input_path.open(newline="", encoding="utf-8") as f:
+                        total_rows = sum(1 for _ in f) - 1  # Subtract header
+                except Exception:
+                    total_rows = 0
                 pending: List[PendingRow] = []
                 start_time = time.time()
                 
@@ -683,7 +692,10 @@ def run_gui() -> None:
                         if len(pending) >= self.batch_size:
                             flush_batch(pending)
                             pending.clear()
-                            if seen % 1000 == 0:
+                            if seen % 1000 == 0 or seen == total_rows:
+                                pct = int((seen / total_rows) * 100) if total_rows > 0 else 0
+                                info = f"Row {seen:,} of {total_rows:,} ({pct}%)"
+                                self.progress_bar_update.emit(pct, info)
                                 self.progress_update.emit(f"Processed {seen:,} rows ({processed:,} written, {skipped:,} skipped)")
                     
                     if pending and (not self.debug_limit or (processed + skipped) < self.debug_limit):
@@ -857,6 +869,16 @@ def run_gui() -> None:
             progress_group = QGroupBox("Progress")
             progress_layout = QVBoxLayout()
             
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(0)
+            progress_layout.addWidget(self.progress_bar)
+            
+            self.progress_info_label = QLabel("Ready to start")
+            self.progress_info_label.setStyleSheet("color: #666; font-size: 11px;")
+            progress_layout.addWidget(self.progress_info_label)
+            
             self.log_text = QTextEdit()
             self.log_text.setReadOnly(True)
             self.log_text.setMaximumHeight(200)
@@ -865,18 +887,14 @@ def run_gui() -> None:
             progress_group.setLayout(progress_layout)
             layout.addWidget(progress_group)
             
-            # Control buttons
+            # Control button (toggle between start and stop)
             button_layout = QHBoxLayout()
-            self.start_btn = QPushButton("Start MLM Inference")
-            self.start_btn.clicked.connect(self.start_inference)
-            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
-            self.stop_btn = QPushButton("Stop")
-            self.stop_btn.clicked.connect(self.stop_inference)
-            self.stop_btn.setEnabled(False)
-            self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
+            self.control_btn = QPushButton("Start MLM Inference")
+            self.control_btn.clicked.connect(self.toggle_inference)
+            self.control_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; min-width: 150px;")
+            self.is_running = False
             button_layout.addStretch()
-            button_layout.addWidget(self.start_btn)
-            button_layout.addWidget(self.stop_btn)
+            button_layout.addWidget(self.control_btn)
             button_layout.addStretch()
             layout.addLayout(button_layout)
             
@@ -973,6 +991,18 @@ def run_gui() -> None:
                 self.log_text.verticalScrollBar().maximum()
             )
         
+        def update_progress_bar(self, percentage: int, row_info: str):
+            """Update the progress bar and info label."""
+            self.progress_bar.setValue(percentage)
+            self.progress_info_label.setText(row_info)
+        
+        def toggle_inference(self):
+            """Toggle between start and stop MLM inference."""
+            if not self.is_running:
+                self.start_inference()
+            else:
+                self.stop_inference()
+        
         def start_inference(self):
             """Start the MLM inference process."""
             if not self.input_text.text():
@@ -1025,9 +1055,12 @@ def run_gui() -> None:
                 self.log(f"Debug limit: {self.debug_spin.value()}")
             self.log("")
             
+            # Update button to stop mode
+            self.is_running = True
+            self.control_btn.setText("Stop MLM Inference")
+            self.control_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 8px; min-width: 150px;")
+            
             # Disable controls
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
             self.input_browse.setEnabled(False)
             self.output_browse.setEnabled(False)
             
@@ -1043,6 +1076,7 @@ def run_gui() -> None:
             )
             
             self.worker.progress_update.connect(self.log)
+            self.worker.progress_bar_update.connect(self.update_progress_bar)
             self.worker.finished.connect(self.on_finished)
             self.worker.start()
         
@@ -1056,10 +1090,13 @@ def run_gui() -> None:
         
         def on_finished(self, success: bool, message: str):
             """Handle MLM inference completion."""
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            self.is_running = False
+            self.control_btn.setText("Start MLM Inference")
+            self.control_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; min-width: 150px;")
             self.input_browse.setEnabled(True)
             self.output_browse.setEnabled(True)
+            self.progress_bar.setValue(100 if success else 0)
+            self.progress_info_label.setText("Complete" if success else "Ready to start")
             
             self.log("")
             self.log("=" * 60)
