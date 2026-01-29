@@ -340,7 +340,7 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None) -> None:
         log(f"Debug - CSV has {len(reader.fieldnames)} columns")
         log(f"Debug - All column names: {reader.fieldnames}")
         log(f"Debug - Requested {len(group_cols)} group columns: {group_cols[:3]}...")
-        log(f"Debug - Available columns containing these groups:")
+        log("Debug - Available columns containing these groups:")
         
         # Build mapping from clean group names to actual column names (which may have BOM)
         group_col_mapping = {}
