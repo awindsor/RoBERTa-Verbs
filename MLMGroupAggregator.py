@@ -1213,11 +1213,9 @@ def run_gui() -> None:
                     )
                     return
                 if tool == "RoBERTaMaskedLanguageModelVerbs":
-                    if input_files.get("mlm_csv"):
-                        self.mlm_input.setText(input_files["mlm_csv"])
                     if metadata.get("output_file"):
-                        self.output_input.setText(metadata.get("output_file", ""))
-                    # User must provide group CSV
+                        self.mlm_input.setText(metadata.get("output_file", ""))
+                    # User must provide group CSV and output file
                     self.topk_spin.setValue(settings.get("top_k", 0))
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
                     self.short_check.setChecked(settings.get("short", False))
