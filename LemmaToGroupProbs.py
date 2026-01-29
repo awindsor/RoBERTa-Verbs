@@ -37,7 +37,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -101,7 +101,7 @@ def save_metadata(
     """Write metadata JSON next to the output file."""
     json_path = output_path.with_suffix(".json")
     metadata: Dict[str, Any] = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": "LemmaToGroupProbs",
         "versions": get_lemma_to_group_version_info(),
         "input_file": str(input_path),
@@ -311,11 +311,12 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None) -> None:
         with meta_path.open("r", encoding="utf-8") as f:
             source_metadata = json.load(f)
         # Try to pull defaults from metadata if not explicitly provided
-        if parsed.group_cols is None:
-            if "groups" in source_metadata and isinstance(source_metadata["groups"], dict):
-                parsed.group_cols = list(source_metadata["groups"].keys())
-        if not parsed.lemma_col and "settings" in source_metadata:
-            parsed.lemma_col = source_metadata.get("settings", {}).get("lemma_col", parsed.lemma_col)
+        if source_metadata is not None:
+            if parsed.group_cols is None:
+                if "groups" in source_metadata and isinstance(source_metadata["groups"], dict):
+                    parsed.group_cols = list(source_metadata["groups"].keys())
+            if not parsed.lemma_col and "settings" in source_metadata:
+                parsed.lemma_col = source_metadata.get("settings", {}).get("lemma_col", parsed.lemma_col)
 
     input_path = Path(parsed.input_csv)
     output_path = Path(parsed.output)
@@ -331,7 +332,7 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None) -> None:
         if parsed.lemma_col not in reader.fieldnames:
             raise SystemExit(f"Missing lemma column {parsed.lemma_col!r}")
 
-        group_cols = parsed.group_cols or infer_group_cols(reader.fieldnames)
+        group_cols = parsed.group_cols or infer_group_cols(list(reader.fieldnames))
         if not group_cols:
             raise SystemExit("Could not infer group columns. Provide --group-cols explicitly.")
         
@@ -585,7 +586,7 @@ def run_gui() -> None:
             self.lemma_edit = QLineEdit("lemma")
             self.group_edit = QLineEdit()
             self.encoding_edit = QLineEdit("utf-8")
-            self.meta_edit = QLineEdit()
+            self.meta_path: Optional[Path] = None
             self.second_spin = QSpinBox()
             self.second_spin.setRange(0, 100)
             self.second_spin.setValue(50)
@@ -602,12 +603,12 @@ def run_gui() -> None:
 
             browse_in = QPushButton("Browse Input")
             browse_out = QPushButton("Browse Output")
-            browse_meta = QPushButton("Browse Metadata")
+            load_json_btn = QPushButton("Load JSON")
             run_btn = QPushButton("Run")
 
             browse_in.clicked.connect(self.pick_input)
             browse_out.clicked.connect(self.pick_output)
-            browse_meta.clicked.connect(self.pick_metadata)
+            load_json_btn.clicked.connect(self.pick_metadata)
             run_btn.clicked.connect(self.start)
 
             grid = QGridLayout()
@@ -617,17 +618,15 @@ def run_gui() -> None:
             grid.addWidget(QLabel("Output CSV/XLSX"), 1, 0)
             grid.addWidget(self.output_edit, 1, 1)
             grid.addWidget(browse_out, 1, 2)
-            grid.addWidget(QLabel("Metadata JSON (optional)"), 2, 0)
-            grid.addWidget(self.meta_edit, 2, 1)
-            grid.addWidget(browse_meta, 2, 2)
-            grid.addWidget(QLabel("Lemma column"), 3, 0)
-            grid.addWidget(self.lemma_edit, 3, 1)
-            grid.addWidget(QLabel("Group cols (comma)"), 4, 0)
-            grid.addWidget(self.group_edit, 4, 1)
-            grid.addWidget(QLabel("Second threshold (% of top)"), 5, 0)
-            grid.addWidget(self.second_spin, 5, 1)
-            grid.addWidget(QLabel("Encoding"), 6, 0)
-            grid.addWidget(self.encoding_edit, 6, 1)
+            grid.addWidget(load_json_btn, 1, 3)
+            grid.addWidget(QLabel("Lemma column"), 2, 0)
+            grid.addWidget(self.lemma_edit, 2, 1)
+            grid.addWidget(QLabel("Group cols (comma)"), 3, 0)
+            grid.addWidget(self.group_edit, 3, 1)
+            grid.addWidget(QLabel("Second threshold (% of top)"), 4, 0)
+            grid.addWidget(self.second_spin, 4, 1)
+            grid.addWidget(QLabel("Encoding"), 5, 0)
+            grid.addWidget(self.encoding_edit, 5, 1)
 
             box = QGroupBox("Run")
             box.setLayout(grid)
@@ -659,54 +658,60 @@ def run_gui() -> None:
 
         def pick_metadata(self):
             path, _ = QFileDialog.getOpenFileName(self, "Select metadata JSON", "", "JSON Files (*.json)")
-            if path:
-                self.meta_edit.setText(path)
-                try:
-                    with Path(path).open("r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    tool = meta.get("tool")
-                    if tool == "LemmaToGroupProbs":
-                        input_file = meta.get("input_file")
-                        if input_file:
-                            input_path = Path(str(input_file))
-                            if input_path.suffix.lower() == ".csv":
-                                self.input_edit.setText(input_file)
-                            else:
-                                QMessageBox.warning(self, "Metadata error", f"Input file in metadata is not a .csv file: {input_file}")
-                        output_file = meta.get("output_file")
-                        if output_file:
-                            self.output_edit.setText(output_file)
-                        settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
-                        lemma_col = settings.get("lemma_col")
-                        if lemma_col:
-                            self.lemma_edit.setText(str(lemma_col))
-                        group_cols = settings.get("group_cols")
-                        if isinstance(group_cols, list):
-                            self.group_edit.setText(", ".join(map(str, group_cols)))
-                        second = settings.get("second_threshold")
-                        if isinstance(second, (int, float)) and 0.0 <= second <= 1.0:
-                            self.second_spin.setValue(int(round(second * 100)))
-                        encoding = settings.get("encoding")
-                        if encoding:
-                            self.encoding_edit.setText(str(encoding))
-                    elif tool == "MLMGroupAggregator":
-                        # Populate what we can: input file (aggregated output), lemma column, group columns
-                        output_file = meta.get("output_file")
-                        if output_file:
-                            output_path = Path(str(output_file))
-                            if output_path.suffix.lower() == ".csv":
-                                self.input_edit.setText(str(output_file))
-                            else:
-                                QMessageBox.warning(self, "Metadata error", f"Output file in metadata is not a .csv file: {output_file}")
-                        settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
-                        lemma_col = settings.get("lemma_col")
-                        if lemma_col:
-                            self.lemma_edit.setText(str(lemma_col))
-                        groups = meta.get("groups")
-                        if isinstance(groups, dict):
-                            self.group_edit.setText(", ".join(map(str, groups.keys())))
-                except Exception:
-                    QMessageBox.warning(self, "Metadata error", "Could not read metadata JSON")
+            if not path:
+                return
+            self.meta_path = Path(path)
+            try:
+                with Path(path).open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                tool = meta.get("tool")
+                if tool == "LemmaToGroupProbs":
+                    input_file = meta.get("input_file")
+                    if input_file:
+                        input_path = Path(str(input_file))
+                        if input_path.suffix.lower() == ".csv":
+                            self.input_edit.setText(input_file)
+                        else:
+                            QMessageBox.warning(self, "Metadata error", f"Input file in metadata is not a .csv file: {input_file}")
+                    output_file = meta.get("output_file")
+                    if output_file:
+                        self.output_edit.setText(output_file)
+                    settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
+                    lemma_col = settings.get("lemma_col")
+                    if lemma_col:
+                        self.lemma_edit.setText(str(lemma_col))
+                    group_cols = settings.get("group_cols")
+                    if isinstance(group_cols, list):
+                        self.group_edit.setText(", ".join(map(str, group_cols)))
+                    second = settings.get("second_threshold")
+                    if isinstance(second, (int, float)) and 0.0 <= second <= 1.0:
+                        self.second_spin.setValue(int(round(second * 100)))
+                    encoding = settings.get("encoding")
+                    if encoding:
+                        self.encoding_edit.setText(str(encoding))
+                elif tool == "MLMGroupAggregator":
+                    # Populate input file, lemma column, group columns (everything except output file)
+                    output_file = meta.get("output_file")
+                    if output_file:
+                        output_path = Path(str(output_file))
+                        if output_path.suffix.lower() == ".csv":
+                            self.input_edit.setText(str(output_file))
+                        else:
+                            QMessageBox.warning(self, "Metadata error", f"Output file in metadata is not a .csv file: {output_file}")
+                    settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
+                    lemma_col = settings.get("lemma_col")
+                    if lemma_col:
+                        self.lemma_edit.setText(str(lemma_col))
+                    groups = meta.get("groups")
+                    if isinstance(groups, dict):
+                        self.group_edit.setText(", ".join(map(str, groups.keys())))
+                    # Also populate max_k from top_k setting if available
+                    top_k = settings.get("top_k")
+                    if top_k and isinstance(top_k, int) and top_k > 0:
+                        # Note: max_k is informational for LemmaToGroupProbs and usually inferred
+                        pass
+            except Exception:
+                QMessageBox.warning(self, "Metadata error", "Could not read metadata JSON")
 
         def start(self):
             input_path = Path(self.input_edit.text().strip())
@@ -728,10 +733,6 @@ def run_gui() -> None:
             group_cols = [c.strip() for c in self.group_edit.text().split(",") if c.strip()] or None
             second_threshold = self.second_spin.value() / 100.0
             encoding = self.encoding_edit.text().strip() or "utf-8"
-            meta_path = Path(self.meta_edit.text().strip()) if self.meta_edit.text().strip() else None
-            if meta_path and not meta_path.exists():
-                QMessageBox.warning(self, "Metadata missing", "Metadata JSON not found")
-                return
 
             self.log.clear()
             self.log.append("Starting worker thread...")
@@ -742,7 +743,7 @@ def run_gui() -> None:
                 group_cols=group_cols,
                 second_threshold=second_threshold,
                 encoding=encoding,
-                metadata_path=meta_path,
+                metadata_path=self.meta_path,
             )
             self.worker.progress.connect(self.append_log)
             self.worker.progress_value.connect(self.update_progress)
