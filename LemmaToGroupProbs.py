@@ -491,6 +491,7 @@ def run_gui() -> None:
             QLineEdit,
             QMainWindow,
             QMessageBox,
+            QProgressBar,
             QPushButton,
             QSpinBox,
             QTextEdit,
