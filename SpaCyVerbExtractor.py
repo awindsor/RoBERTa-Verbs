@@ -498,13 +498,13 @@ def run_cli() -> None:
         
         if issues["missing_files"]:
             logger.warning("⚠ Missing input files:")
-            for f in issues["missing_files"]:
-                logger.warning(f"   {f}")
+            for file_path in issues["missing_files"]:
+                logger.warning(f"   {file_path}")
         
         if issues["checksum_mismatches"]:
             logger.warning("⚠ Input files have changed (checksum mismatch):")
-            for f in issues["checksum_mismatches"]:
-                logger.warning(f"   {f}")
+            for file_path in issues["checksum_mismatches"]:
+                logger.warning(f"   {file_path}")
         
         if issues["missing_files"] or issues["checksum_mismatches"]:
             logger.warning("⚠ Proceeding with extraction despite file changes")
@@ -1540,9 +1540,9 @@ def run_gui() -> None:
                 # Show warnings if issues found
                 warnings = []
                 if missing_files:
-                    warnings.append(f"⚠ Missing input files:\n" + "\n".join(missing_files))
+                    warnings.append("⚠ Missing input files:\n" + "\n".join(missing_files))
                 if checksum_mismatches:
-                    warnings.append(f"⚠ Input files have changed (checksum mismatch):\n" + "\n".join(checksum_mismatches))
+                    warnings.append("⚠ Input files have changed (checksum mismatch):\n" + "\n".join(checksum_mismatches))
                 
                 if warnings:
                     msg = "\n\n".join(warnings) + "\n\nContinue loading settings anyway?"
@@ -1622,15 +1622,15 @@ def run_gui() -> None:
                     if issues["missing_files"] or issues["checksum_mismatches"]:
                         warnings = []
                         if issues["missing_files"]:
-                            warnings.append(f"⚠ Missing from metadata:\n" + "\n".join(issues["missing_files"]))
+                            warnings.append("⚠ Missing from metadata:\n" + "\n".join(issues["missing_files"]))
                         if issues["checksum_mismatches"]:
-                            warnings.append(f"⚠ Changed since last run (checksum mismatch):\n" + "\n".join(issues["checksum_mismatches"]))
+                            warnings.append("⚠ Changed since last run (checksum mismatch):\n" + "\n".join(issues["checksum_mismatches"]))
                         
                         msg = "\n\n".join(warnings) + "\n\nContinue with extraction?"
                         reply = QMessageBox.warning(self, "Input File Checksum Mismatch", msg, QMessageBox.Yes | QMessageBox.No)
                         if reply == QMessageBox.No:
                             return
-                except Exception as e:
+                except Exception:
                     # Metadata issues shouldn't block extraction
                     pass
             
