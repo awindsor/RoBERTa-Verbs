@@ -47,6 +47,8 @@ from tqdm import tqdm
 # Enable PyTorch MPS fallback for Apple Silicon GPUs
 # Per https://explosion.ai/blog/metal-performance-shaders
 # This allows MPS operations to work while gracefully falling back to CPU for unsupported ops
+# NOTE: This MUST be set before PyTorch is imported for the first time.
+# If you're getting MPS errors, use the run_with_mps.py launcher instead.
 if "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -226,11 +228,22 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
         # Try to enable GPU if available, but fall back to CPU if it fails
         if logger:
             try:
-                from spacy import prefer_gpu
-                if prefer_gpu():
-                    logger.info("GPU acceleration enabled for spaCy")
-                else:
-                    logger.info("Using CPU (GPU not available for this model)")
+                # Check if MPS fallback is properly configured
+                import torch
+                if torch.backends.mps.is_available():
+                    fallback_enabled = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
+                    if not fallback_enabled:
+                        logger.warning(
+                            "MPS is available but PYTORCH_ENABLE_MPS_FALLBACK is not set. "
+                            "This may cause 'placeholder storage' errors. "
+                            "Use run_with_mps.py launcher script for proper MPS support."
+                        )
+                
+                # Use require_gpu() as recommended by Explosion AI
+                # https://explosion.ai/blog/metal-performance-shaders
+                from spacy import require_gpu
+                gpu_id = require_gpu()
+                logger.info(f"GPU acceleration enabled for spaCy (GPU {gpu_id})")
             except RuntimeError as e:
                 # MPS/GPU error - should be handled by PYTORCH_ENABLE_MPS_FALLBACK
                 error_str = str(e).lower()
@@ -241,9 +254,10 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
                         f"Use --force-cpu to disable GPU entirely if issues persist."
                     )
                 else:
-                    logger.debug(f"Could not enable GPU: {e}")
+                    # No GPU available, that's fine
+                    logger.info("GPU not available, using CPU")
             except Exception as e:
-                logger.debug(f"Could not enable GPU: {e}")
+                logger.info(f"GPU not available, using CPU: {e}")
         
         return nlp
     except OSError as e:
