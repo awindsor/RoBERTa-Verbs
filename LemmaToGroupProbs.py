@@ -375,7 +375,6 @@ def write_excel(
     
     except Exception as e:
         logger.exception("write_excel: %s: %s", type(e).__name__, e)
-        import traceback
         raise
 
 
