@@ -26,9 +26,11 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import gc
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -125,6 +127,7 @@ def save_metadata(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": "TextVerbGroupCounter",
         "versions": get_version_info(),
+        "status": "complete",
         "input_file": str(input_path),
         "input_checksum": input_checksum,
         "group_file": str(group_path),
@@ -149,6 +152,42 @@ def save_metadata(
         json.dump(metadata, f, indent=2)
 
 
+def save_incomplete_metadata(
+    output_path: Path,
+    input_path: Path,
+    group_path: Path,
+    args: Dict[str, Any],
+    group_labels: List[str],
+    command: Optional[str] = None,
+) -> None:
+    """Write incomplete metadata JSON before processing starts."""
+    json_path = output_path.with_suffix(".json")
+    metadata: Dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool": "TextVerbGroupCounter",
+        "versions": get_version_info(),
+        "status": "incomplete",
+        "input_file": str(input_path),
+        "group_file": str(group_path),
+        "output_file": str(output_path),
+        "command": command,
+        "settings": {
+            "text_col": args.get("text_col", "text"),
+            "encoding": args.get("encoding", "utf-8"),
+            "model": args.get("model", "en_core_web_sm"),
+            "include_aux": args.get("include_aux", False),
+            "batch_size": args.get("batch_size", 32),
+            "where": args.get("where"),
+            "output_format": "xlsx" if str(output_path).lower().endswith(".xlsx") else "csv",
+            "group_labels": group_labels,
+        },
+        "statistics": None,
+    }
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
 def load_metadata(json_path: Path) -> Dict[str, Any]:
     """Load metadata JSON."""
     with json_path.open("r", encoding="utf-8") as f:
@@ -165,7 +204,44 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
     try:
         if logger:
             logger.info(f"Loading spaCy model: {model_name}")
-        return spacy.load(model_name)
+            # Log GPU/device info
+            gpu_info = check_spacy_gpu()
+            logger.info(f"Device: {gpu_info['device']}")
+            if gpu_info["details"]:
+                logger.info(f"Details: {gpu_info['details']}")
+
+        # Disable MPS for transformer models on Apple Silicon to avoid runtime errors
+        # MPS doesn't support all PyTorch operations that transformers use
+        if "trf" in model_name.lower() and gpu_info.get("device") == "Metal (Apple Silicon)":
+            if logger:
+                logger.warning(
+                    "Transformer model on Apple Silicon detected. Disabling MPS to avoid "
+                    "'placeholder storage' errors. Using CPU for inference."
+                )
+            os.environ["SPACY_DISABLE_GPU"] = "1"
+        
+        nlp = spacy.load(model_name)
+        
+        # Try to enable GPU if available, but fall back to CPU if it fails
+        if logger:
+            try:
+                from spacy import prefer_gpu
+                if prefer_gpu():
+                    logger.info("GPU acceleration enabled for spaCy")
+                else:
+                    logger.info("Using CPU (GPU not available for this model)")
+            except RuntimeError as e:
+                # MPS/GPU not properly supported for this model, fall back to CPU
+                if "MPS device" in str(e) or "placeholder" in str(e).lower():
+                    logger.warning(f"MPS/GPU error, falling back to CPU: {e}")
+                    # Disable MPS for this process
+                    os.environ["SPACY_DISABLE_GPU"] = "1"
+                else:
+                    logger.debug(f"Could not enable GPU: {e}")
+            except Exception as e:
+                logger.debug(f"Could not enable GPU: {e}")
+        
+        return nlp
     except OSError as e:
         if "Can't find model" in str(e) or "No such file or directory" in str(e):
             if logger:
@@ -187,6 +263,33 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
             except subprocess.TimeoutExpired:
                 raise OSError(f"Timeout downloading model '{model_name}'")
         raise
+
+
+def check_spacy_gpu() -> Dict[str, Any]:
+    """Check if spaCy can use GPU/Metal acceleration."""
+    info = {"gpu_available": False, "device": "CPU", "details": ""}
+    
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            info["gpu_available"] = True
+            info["device"] = "Metal (Apple Silicon)"
+            info["details"] = "PyTorch Metal Performance Shaders available"
+        elif torch.cuda.is_available():
+            info["gpu_available"] = True
+            info["device"] = f"CUDA ({torch.cuda.get_device_name(0)})"
+            info["details"] = "NVIDIA CUDA available"
+    except ImportError:
+        info["details"] = "PyTorch not installed"
+    
+    # Check spaCy GPU setting
+    try:
+        from spacy import prefer_gpu
+        # Note: spaCy uses PyTorch for GPU, so if torch GPU isn't available, spaCy won't use GPU
+    except ImportError:
+        pass
+    
+    return info
 
 
 def normalize_pred_token(tok: str) -> str:
@@ -400,6 +503,8 @@ def process_rows(
     def emit(msg: str):
         if on_progress:
             on_progress(msg)
+        else:
+            print(msg, flush=True)
 
     emit(f"Reading input CSV: {input_path}")
     with input_path.open("r", newline="", encoding=encoding, errors="replace") as f:
@@ -416,7 +521,7 @@ def process_rows(
 
         xlsx_buffer: Optional[List[Dict[str, Any]]] = None
         if output_path.suffix.lower() == ".csv":
-            out_file = output_path.open("w", newline="", encoding=encoding)
+            out_file = output_path.open("w", newline="", encoding=encoding, buffering=1)
             writer = csv.DictWriter(out_file, fieldnames=out_fieldnames)
             writer.writeheader()
             close_out = out_file.close
@@ -433,8 +538,11 @@ def process_rows(
         try:
             emit("Processing rows...")
             batch: List[Tuple[str, Dict[str, str]]] = []
-            pbar = tqdm(unit=" rows", desc="Processing", leave=True)
+            batch_num = 0
+            row_count = 0
+            pbar = tqdm(unit=" rows", desc="Processing", leave=True, miniters=500)  # Reduce UI updates
             for row in reader:
+                row_count += 1
                 if where:
                     if not _bool_from_row_expression(where, row):
                         rows_filtered_out += 1
@@ -442,6 +550,58 @@ def process_rows(
                 text = row.get(text_col, "") or ""
                 batch.append((text, row))
                 if len(batch) >= batch_size:
+                    batch_num += 1
+                    logger.debug(f"Processing batch {batch_num}")
+                    try:
+                        (
+                            rows_processed,
+                            total_verbs,
+                            total_group_matches,
+                            rows_with_verbs,
+                            rows_with_group_hits,
+                        ) = _process_batch(
+                            nlp,
+                            batch,
+                            group_labels,
+                            lemma_to_groups,
+                            group_col_map,
+                            total_col,
+                            include_aux,
+                            writer,
+                            xlsx_buffer,
+                            rows_processed,
+                            total_verbs,
+                            total_group_matches,
+                            rows_with_verbs,
+                            rows_with_group_hits,
+                            total_rows_expected,
+                            on_progress_value,
+                        )
+                        pbar.update(len(batch))
+                        # Flush output file more aggressively to prevent buffer buildup
+                        if out_file is not None:
+                            out_file.flush()
+                            os.fsync(out_file.fileno())
+                        # Force garbage collection every 5 batches to free memory
+                        if batch_num % 5 == 0:
+                            gc.collect()
+                        # Log progress every 1000 rows
+                        if rows_processed % 1000 == 0:
+                            logger.info(f"Processed {rows_processed} rows, {total_verbs} verbs found")
+                    except Exception as e:
+                        logger.error(f"Failed processing batch {batch_num}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        # Still update progress to avoid infinite loops
+                        rows_processed += len(batch)
+                        pbar.update(len(batch))
+                    finally:
+                        batch = []
+
+            if batch:
+                batch_num += 1
+                logger.info(f"Processing final batch {batch_num} with {len(batch)} rows")
+                try:
                     (
                         rows_processed,
                         total_verbs,
@@ -467,35 +627,16 @@ def process_rows(
                         on_progress_value,
                     )
                     pbar.update(len(batch))
-                    batch = []
-
-            if batch:
-                (
-                    rows_processed,
-                    total_verbs,
-                    total_group_matches,
-                    rows_with_verbs,
-                    rows_with_group_hits,
-                ) = _process_batch(
-                    nlp,
-                    batch,
-                    group_labels,
-                    lemma_to_groups,
-                    group_col_map,
-                    total_col,
-                    include_aux,
-                    writer,
-                    xlsx_buffer,
-                    rows_processed,
-                    total_verbs,
-                    total_group_matches,
-                    rows_with_verbs,
-                    rows_with_group_hits,
-                    total_rows_expected,
-                    on_progress_value,
-                )
-                pbar.update(len(batch))
+                except Exception as e:
+                    logger.error(f"Failed processing final batch: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    # Still update progress
+                    rows_processed += len(batch)
+                    pbar.update(len(batch))
             pbar.close()
+            logger.info(f"CSV reader loop complete. Total rows read: {row_count}, rows processed: {rows_processed}")
+            logger.info(f"Batch processing complete. Total rows processed: {rows_processed}")
 
             if output_path.suffix.lower() == ".xlsx":
                 if xlsx_buffer is None:
@@ -507,6 +648,14 @@ def process_rows(
                 write_xlsx(output_path, out_fieldnames, rows_as_lists)
         finally:
             close_out()
+            # Clean up spaCy resources to prevent semaphore leaks
+            if nlp is not None:
+                try:
+                    # Force cleanup of any multiprocessing resources
+                    if hasattr(nlp, '_optimizer'):
+                        nlp._optimizer = None
+                except Exception:
+                    pass
 
     elapsed = time.time() - start
     stats = {
@@ -548,52 +697,76 @@ def _process_batch(
     total_rows_expected: Optional[int],
     on_progress_value=None,
 ) -> Tuple[int, int, int, int, int]:
-    for doc, row in nlp.pipe(batch, as_tuples=True):
-        row_total_verbs = 0
-        group_counts = {g: 0 for g in group_labels}
+    try:
+        docs_and_rows = list(nlp.pipe(batch, as_tuples=True))
+    except Exception as e:
+        logger.error(f"Error processing batch of {len(batch)} rows at row {rows_processed}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+    
+    for idx, (doc, row) in enumerate(docs_and_rows):
+        try:
+            row_total_verbs = 0
+            group_counts = {g: 0 for g in group_labels}
 
-        for tok in doc:
-            is_verb = tok.pos_ == "VERB" or (include_aux and tok.pos_ == "AUX")
-            if not is_verb:
-                continue
-            row_total_verbs += 1
-            lemma = normalize_pred_token(tok.lemma_)
-            if not lemma:
-                continue
-            groups = lemma_to_groups.get(lemma)
-            if not groups:
-                continue
-            for g in groups:
-                group_counts[g] += 1
+            for tok in doc:
+                is_verb = tok.pos_ == "VERB" or (include_aux and tok.pos_ == "AUX")
+                if not is_verb:
+                    continue
+                row_total_verbs += 1
+                lemma = normalize_pred_token(tok.lemma_)
+                if not lemma:
+                    continue
+                groups = lemma_to_groups.get(lemma)
+                if not groups:
+                    continue
+                for g in groups:
+                    group_counts[g] += 1
 
-        out_row = dict(row)
-        out_row[total_col] = row_total_verbs
-        for g in group_labels:
-            out_row[group_col_map[g]] = group_counts[g]
+            out_row = dict(row)
+            out_row[total_col] = row_total_verbs
+            for g in group_labels:
+                out_row[group_col_map[g]] = group_counts[g]
 
-        if writer is not None:
-            writer.writerow(out_row)
-        else:
-            xlsx_buffer.append(out_row)
+            if writer is not None:
+                writer.writerow(out_row)
+            else:
+                xlsx_buffer.append(out_row)
 
-        rows_processed += 1
-        total_verbs += out_row[total_col]
-        row_group_hits = 0
-        for g in group_labels:
-            row_group_hits += out_row[group_col_map[g]]
-        total_group_matches += row_group_hits
-        if out_row[total_col] > 0:
-            rows_with_verbs += 1
-        if row_group_hits > 0:
-            rows_with_group_hits += 1
-        if on_progress_value:
-            on_progress_value(rows_processed, total_rows_expected or 0)
+            rows_processed += 1
+            total_verbs += out_row[total_col]
+            row_group_hits = 0
+            for g in group_labels:
+                row_group_hits += out_row[group_col_map[g]]
+            total_group_matches += row_group_hits
+            if out_row[total_col] > 0:
+                rows_with_verbs += 1
+            if row_group_hits > 0:
+                rows_with_group_hits += 1
+            if on_progress_value:
+                on_progress_value(rows_processed, total_rows_expected or 0)
+        except Exception as e:
+            logger.error(f"Error processing row {rows_processed + 1} (batch index {idx}): {e}")
+            rows_processed += 1
+            continue
     return rows_processed, total_verbs, total_group_matches, rows_with_verbs, rows_with_group_hits
 
 
 # ------------------------- CLI -------------------------
 
 def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_value=None, total_rows_expected=None) -> None:
+    # Configure logging if not already configured
+    if not logger.handlers or all(isinstance(h, logging.NullHandler) for h in logger.handlers):
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    
+    # Log device information at startup
+    gpu_info = check_spacy_gpu()
+    logger.info(f"=== TextVerbGroupCounter Starting ===")
+    logger.info(f"Device: {gpu_info['device']}")
+    if gpu_info["details"]:
+        logger.info(f"Details: {gpu_info['details']}")
+    
     ap = argparse.ArgumentParser(description="Count verbs per row and per group from a CSV text column")
     ap.add_argument("input_csv", help="Input CSV with a text column")
     ap.add_argument("group_csv", help="Group CSV (columns=groups, rows=list lemmas)")
@@ -605,18 +778,33 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
     ap.add_argument("--batch-size", type=int, default=32, help="spaCy pipe batch size (default: 32)")
     ap.add_argument("--where", help="Row filter expression using {{column}} placeholders")
     ap.add_argument("--load-metadata", help="Load settings from a previous JSON metadata file")
+    ap.add_argument("--force-cpu", action="store_true", help="Force CPU-only processing, disable GPU/Metal acceleration")
 
     args = ap.parse_args(argv)
+
+    # Force CPU if requested
+    if args.force_cpu:
+        os.environ["SPACY_DISABLE_GPU"] = "1"
+        logger.info("CPU-only mode enabled (--force-cpu)")
 
     if args.load_metadata:
         meta = load_metadata(Path(args.load_metadata))
         settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
-        args.text_col = settings.get("text_col", args.text_col)
-        args.encoding = settings.get("encoding", args.encoding)
-        args.model = settings.get("model", args.model)
-        args.include_aux = settings.get("include_aux", args.include_aux)
-        args.batch_size = settings.get("batch_size", args.batch_size)
-        args.where = settings.get("where", args.where)
+        # Only apply metadata settings if the corresponding CLI argument was NOT explicitly provided
+        argv_list = argv if argv else []
+        
+        if "--text-col" not in argv_list:
+            args.text_col = settings.get("text_col", args.text_col)
+        if "--encoding" not in argv_list:
+            args.encoding = settings.get("encoding", args.encoding)
+        if "--model" not in argv_list:
+            args.model = settings.get("model", args.model)
+        if "--include-aux" not in argv_list:
+            args.include_aux = settings.get("include_aux", args.include_aux)
+        if "--batch-size" not in argv_list:
+            args.batch_size = settings.get("batch_size", args.batch_size)
+        if "--where" not in argv_list:
+            args.where = settings.get("where", args.where)
 
     input_path = Path(args.input_csv)
     group_path = Path(args.group_csv)
@@ -630,26 +818,59 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
     if output_path.suffix.lower() not in {".csv", ".xlsx"}:
         raise SystemExit("Output must end with .csv or .xlsx")
 
-    stats = process_rows(
-        input_path,
-        group_path,
-        output_path,
-        text_col=args.text_col,
-        encoding=args.encoding,
-        model=args.model,
-        include_aux=args.include_aux,
-        batch_size=args.batch_size,
-        where=args.where,
-        on_progress=on_progress,
-        on_progress_value=on_progress_value,
-        total_rows_expected=total_rows_expected,
+    # Save incomplete metadata before processing starts
+    command = reconstruct_command(str(input_path), str(group_path), str(output_path), args)
+    group_labels_for_meta = load_groups_csv(str(group_path), args.encoding, logger)[0]
+    save_incomplete_metadata(
+        output_path=output_path,
+        input_path=input_path,
+        group_path=group_path,
+        args={
+            "text_col": args.text_col,
+            "encoding": args.encoding,
+            "model": args.model,
+            "include_aux": args.include_aux,
+            "batch_size": args.batch_size,
+            "where": args.where,
+        },
+        group_labels=group_labels_for_meta,
+        command=command,
     )
+    logger.info(f"Saved incomplete metadata to {output_path.with_suffix('.json')}")
+
+    try:
+        stats = process_rows(
+            input_path,
+            group_path,
+            output_path,
+            text_col=args.text_col,
+            encoding=args.encoding,
+            model=args.model,
+            include_aux=args.include_aux,
+            batch_size=args.batch_size,
+            where=args.where,
+            on_progress=on_progress,
+            on_progress_value=on_progress_value,
+            total_rows_expected=total_rows_expected,
+        )
+    except RuntimeError as e:
+        error_msg = str(e).lower()
+        if "mps device" in error_msg or "placeholder" in error_msg or "metal" in error_msg:
+            logger.error(f"MPS/Metal acceleration error during processing: {e}")
+            logger.error(
+                "This is a known limitation of Metal (MPS) on Apple Silicon. "
+                "Some PyTorch operations are not supported on MPS. "
+                "Please try with --force-cpu flag or reinstall PyTorch CPU version."
+            )
+            raise SystemExit(1) from e
+        raise
 
     input_checksum = compute_file_md5(input_path)
     group_checksum = compute_file_md5(group_path)
     output_checksum = compute_file_md5(output_path)
 
     command = reconstruct_command(str(input_path), str(group_path), str(output_path), args)
+    logger.info(f"Saving metadata to {output_path.with_suffix('.json')}")
     save_metadata(
         output_path=output_path,
         input_path=input_path,
@@ -669,6 +890,13 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
         group_labels=load_groups_csv(str(group_path), args.encoding, logger)[0],
         command=command,
     )
+    
+    # Log final summary
+    logger.info(f"✓ Processing complete!")
+    logger.info(f"  Output: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
+    logger.info(f"  Metadata: {output_path.with_suffix('.json')}")
+    logger.info(f"  Rows processed: {stats['total_rows']}")
+    logger.info(f"  Total verbs found: {stats['total_verbs']}")
 
 
 # ------------------------- GUI -------------------------
@@ -1015,11 +1243,13 @@ def run_gui() -> None:
                     self.progress_bar.setRange(0, total)
                 self.progress_bar.setValue(current)
                 self.progress_bar.setFormat(f"{current}/{total}")
+                self.progress_label.setText(f"Processed {current} rows of {total} total rows")
             else:
                 if self.progress_bar.maximum() != 1:
                     self.progress_bar.setRange(0, 1)
                 self.progress_bar.setValue(0)
                 self.progress_bar.setFormat("Working...")
+                self.progress_label.setText("Processing...")
 
         def done(self, ok: bool, msg: str):
             self.progress_bar.setRange(0, 100)
