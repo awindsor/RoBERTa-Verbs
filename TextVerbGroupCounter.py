@@ -44,6 +44,12 @@ import spacy
 from lemminflect import getLemma
 from tqdm import tqdm
 
+# Enable PyTorch MPS fallback for Apple Silicon GPUs
+# Per https://explosion.ai/blog/metal-performance-shaders
+# This allows MPS operations to work while gracefully falling back to CPU for unsupported ops
+if "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # Import openpyxl at module level to avoid threading issues
 try:
     from openpyxl import Workbook
@@ -209,16 +215,11 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
             logger.info(f"Device: {gpu_info['device']}")
             if gpu_info["details"]:
                 logger.info(f"Details: {gpu_info['details']}")
-
-        # Disable MPS for transformer models on Apple Silicon to avoid runtime errors
-        # MPS doesn't support all PyTorch operations that transformers use
-        if "trf" in model_name.lower() and gpu_info.get("device") == "Metal (Apple Silicon)":
-            if logger:
-                logger.warning(
-                    "Transformer model on Apple Silicon detected. Disabling MPS to avoid "
-                    "'placeholder storage' errors. Using CPU for inference."
-                )
-            os.environ["SPACY_DISABLE_GPU"] = "1"
+            
+            # Note: PYTORCH_ENABLE_MPS_FALLBACK is set at module import
+            # This allows MPS acceleration while gracefully handling unsupported operations
+            if gpu_info.get("device") == "Metal (Apple Silicon)":
+                logger.info("MPS fallback enabled - unsupported operations will use CPU")
         
         nlp = spacy.load(model_name)
         
@@ -231,11 +232,14 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
                 else:
                     logger.info("Using CPU (GPU not available for this model)")
             except RuntimeError as e:
-                # MPS/GPU not properly supported for this model, fall back to CPU
-                if "MPS device" in str(e) or "placeholder" in str(e).lower():
-                    logger.warning(f"MPS/GPU error, falling back to CPU: {e}")
-                    # Disable MPS for this process
-                    os.environ["SPACY_DISABLE_GPU"] = "1"
+                # MPS/GPU error - should be handled by PYTORCH_ENABLE_MPS_FALLBACK
+                error_str = str(e).lower()
+                if "mps" in error_str or "placeholder" in error_str or "metal" in error_str:
+                    logger.warning(
+                        f"MPS initialization issue: {e}. "
+                        f"MPS fallback is enabled; unsupported operations will use CPU. "
+                        f"Use --force-cpu to disable GPU entirely if issues persist."
+                    )
                 else:
                     logger.debug(f"Could not enable GPU: {e}")
             except Exception as e:
@@ -855,12 +859,15 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
         )
     except RuntimeError as e:
         error_msg = str(e).lower()
-        if "mps device" in error_msg or "placeholder" in error_msg or "metal" in error_msg:
+        if "mps" in error_msg or "placeholder" in error_msg or "metal" in error_msg:
             logger.error(f"MPS/Metal acceleration error during processing: {e}")
             logger.error(
-                "This is a known limitation of Metal (MPS) on Apple Silicon. "
-                "Some PyTorch operations are not supported on MPS. "
-                "Please try with --force-cpu flag or reinstall PyTorch CPU version."
+                "MPS fallback (PYTORCH_ENABLE_MPS_FALLBACK) is enabled but this operation failed. "
+                "This may be a PyTorch/spaCy version compatibility issue. "
+                "Solutions: \n"
+                "  1. Use --force-cpu flag to disable GPU entirely\n"
+                "  2. Update PyTorch: pip install --upgrade torch\n"
+                "  3. Update spaCy: pip install --upgrade spacy>=3.4.2 thinc>=8.1.0"
             )
             raise SystemExit(1) from e
         raise
