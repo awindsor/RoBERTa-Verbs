@@ -34,6 +34,7 @@ dev = [
     "ruff>=0.1.0",
 ]
 transformer-model = [
+    "spacy-transformers>=1.1.8",  # Required for transformer + MPS support
     "spacy-curated-transformers>=0.2.0,<0.3.0",
     "en-core-web-trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.2/en_core_web_trf-3.7.2-py3-none-any.whl",
 ]
