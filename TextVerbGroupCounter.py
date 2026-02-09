@@ -225,38 +225,27 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
         
         nlp = spacy.load(model_name)
         
-        # Try to enable GPU if available, but fall back to CPU if it fails
+        # Try to enable GPU if available
         if logger:
+            # Check if MPS fallback is properly configured
+            import torch
+            if torch.backends.mps.is_available():
+                fallback_enabled = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
+                if not fallback_enabled:
+                    logger.warning(
+                        "MPS is available but PYTORCH_ENABLE_MPS_FALLBACK is not set. "
+                        "This may cause 'placeholder storage' errors. "
+                        "Use run_with_mps.py launcher script for proper MPS support."
+                    )
+            
+            # Use require_gpu() as recommended by Explosion AI
+            # https://explosion.ai/blog/metal-performance-shaders
             try:
-                # Check if MPS fallback is properly configured
-                import torch
-                if torch.backends.mps.is_available():
-                    fallback_enabled = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
-                    if not fallback_enabled:
-                        logger.warning(
-                            "MPS is available but PYTORCH_ENABLE_MPS_FALLBACK is not set. "
-                            "This may cause 'placeholder storage' errors. "
-                            "Use run_with_mps.py launcher script for proper MPS support."
-                        )
-                
-                # Use require_gpu() as recommended by Explosion AI
-                # https://explosion.ai/blog/metal-performance-shaders
                 from spacy import require_gpu
                 gpu_id = require_gpu()
                 logger.info(f"GPU acceleration enabled for spaCy (GPU {gpu_id})")
-            except RuntimeError as e:
-                # MPS/GPU error - should be handled by PYTORCH_ENABLE_MPS_FALLBACK
-                error_str = str(e).lower()
-                if "mps" in error_str or "placeholder" in error_str or "metal" in error_str:
-                    logger.warning(
-                        f"MPS initialization issue: {e}. "
-                        f"MPS fallback is enabled; unsupported operations will use CPU. "
-                        f"Use --force-cpu to disable GPU entirely if issues persist."
-                    )
-                else:
-                    # No GPU available, that's fine
-                    logger.info("GPU not available, using CPU")
             except Exception as e:
+                # GPU not available - fall back to CPU without error
                 logger.info(f"GPU not available, using CPU: {e}")
         
         return nlp
@@ -265,21 +254,42 @@ def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
             if logger:
                 logger.info(f"Model '{model_name}' not found locally. Downloading...")
 
-            py_exec = sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
+            # Try to download using uv pip install (works with uv environment)
             try:
                 result = subprocess.run(
-                    [py_exec, "-m", "spacy", "download", model_name],
+                    ["uv", "pip", "install", model_name],
                     capture_output=True,
                     text=True,
                     timeout=300,
                 )
                 if result.returncode != 0:
-                    raise OSError(f"Failed to download model '{model_name}': {result.stderr}")
+                    # If that fails, provide helpful instructions
+                    error_msg = result.stderr or result.stdout
+                    if logger:
+                        logger.error(f"Failed to download model '{model_name}' via uv pip install")
+                        logger.error(f"Error: {error_msg}")
+                        logger.error(f"Try downloading manually with: uv pip install {model_name}")
+                    raise OSError(
+                        f"Failed to download model '{model_name}'.\n"
+                        f"Please download manually with:\n"
+                        f"  uv pip install {model_name}\n"
+                        f"Error: {error_msg}"
+                    )
                 if logger:
-                    logger.info(f"Downloaded model '{model_name}'")
+                    logger.info(f"Downloaded model '{model_name}' successfully")
                 return spacy.load(model_name)
+            except FileNotFoundError:
+                # uv not in PATH
+                if logger:
+                    logger.error("uv command not found in PATH")
+                    logger.error(f"Please download the model manually:")
+                    logger.error(f"  pip install {model_name}")
+                raise OSError(
+                    f"Cannot download model '{model_name}' - uv not found.\n"
+                    f"Please download manually with: pip install {model_name}"
+                )
             except subprocess.TimeoutExpired:
-                raise OSError(f"Timeout downloading model '{model_name}'")
+                raise OSError(f"Timeout downloading model '{model_name}' (took >300s)")
         raise
 
 
@@ -554,6 +564,7 @@ def process_rows(
             raise SystemExit("Output must end with .csv or .xlsx")
 
         try:
+            logger.info(f"Starting row processing with batch_size={batch_size}")
             emit("Processing rows...")
             batch: List[Tuple[str, Dict[str, str]]] = []
             batch_num = 0
@@ -569,7 +580,7 @@ def process_rows(
                 batch.append((text, row))
                 if len(batch) >= batch_size:
                     batch_num += 1
-                    logger.debug(f"Processing batch {batch_num}")
+                    logger.info(f"Processing batch {batch_num} with {len(batch)} rows (starting at row {rows_processed + 1})")
                     try:
                         (
                             rows_processed,
@@ -774,9 +785,24 @@ def _process_batch(
 # ------------------------- CLI -------------------------
 
 def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_value=None, total_rows_expected=None) -> None:
-    # Configure logging if not already configured
+    # Configure logging with both console and file output
     if not logger.handlers or all(isinstance(h, logging.NullHandler) for h in logger.handlers):
-        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+        # File handler - write detailed logs to file with timestamps
+        log_file = Path("TextVerbGroupCounter.log")
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        file_handler.setFormatter(file_formatter)
+        
+        # Console handler - brief output
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_formatter)
+        
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
     
     # Log device information at startup
     gpu_info = check_spacy_gpu()
@@ -856,35 +882,21 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
     )
     logger.info(f"Saved incomplete metadata to {output_path.with_suffix('.json')}")
 
-    try:
-        stats = process_rows(
-            input_path,
-            group_path,
-            output_path,
-            text_col=args.text_col,
-            encoding=args.encoding,
-            model=args.model,
-            include_aux=args.include_aux,
-            batch_size=args.batch_size,
-            where=args.where,
-            on_progress=on_progress,
-            on_progress_value=on_progress_value,
-            total_rows_expected=total_rows_expected,
-        )
-    except RuntimeError as e:
-        error_msg = str(e).lower()
-        if "mps" in error_msg or "placeholder" in error_msg or "metal" in error_msg:
-            logger.error(f"MPS/Metal acceleration error during processing: {e}")
-            logger.error(
-                "MPS fallback (PYTORCH_ENABLE_MPS_FALLBACK) is enabled but this operation failed. "
-                "This may be a PyTorch/spaCy version compatibility issue. "
-                "Solutions: \n"
-                "  1. Use --force-cpu flag to disable GPU entirely\n"
-                "  2. Update PyTorch: pip install --upgrade torch\n"
-                "  3. Update spaCy: pip install --upgrade spacy>=3.4.2 thinc>=8.1.0"
-            )
-            raise SystemExit(1) from e
-        raise
+    # Let all errors propagate with full traceback for debugging
+    stats = process_rows(
+        input_path,
+        group_path,
+        output_path,
+        text_col=args.text_col,
+        encoding=args.encoding,
+        model=args.model,
+        include_aux=args.include_aux,
+        batch_size=args.batch_size,
+        where=args.where,
+        on_progress=on_progress,
+        on_progress_value=on_progress_value,
+        total_rows_expected=total_rows_expected,
+    )
 
     input_checksum = compute_file_md5(input_path)
     group_checksum = compute_file_md5(group_path)
@@ -912,6 +924,10 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
         command=command,
     )
     
+    logger.info(f"=== Processing Complete ===")
+    logger.info(f"Output: {output_path}")
+    logger.info(f"Metadata: {output_path.with_suffix('.json')}")
+    logger.info(f"Log: TextVerbGroupCounter.log")
     # Log final summary
     logger.info(f"✓ Processing complete!")
     logger.info(f"  Output: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
