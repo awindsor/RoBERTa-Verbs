@@ -34,15 +34,20 @@ GUI Mode:
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import json
+import re
 import sys
 import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+
+MODE_ABSOLUTE = "absolute"
+MODE_PERCENT = "percent"
 
 # ============================================================================
 # METADATA FUNCTIONS
@@ -100,6 +105,9 @@ def save_filter_metadata(
             "field": args.get("field", "lemma"),
             "min_freq": args.get("min_freq"),
             "max_freq": args.get("max_freq"),
+            "min_mode": args.get("min_mode", MODE_ABSOLUTE),
+            "max_mode": args.get("max_mode", MODE_ABSOLUTE),
+            "where": args.get("where"),
         },
         "statistics": stats,
     }
@@ -138,7 +146,75 @@ def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
     return True, "Input file verified (checksum OK)"
 
 
-def count_field_freq(path: Path, field: str) -> Counter:
+def _bool_from_row_expression(expr: str, row: Dict[str, str]) -> bool:
+    """Evaluate a boolean expression after replacing {{col}} placeholders."""
+    def replace_placeholder(match: re.Match) -> str:
+        col = match.group(1)
+        return repr(row.get(col, ""))
+
+    replaced = re.sub(r"\{\{\s*([^}]+?)\s*\}\}", replace_placeholder, expr)
+    try:
+        parsed = ast.parse(replaced, mode="eval")
+        return bool(_safe_eval_bool(parsed))
+    except Exception as e:
+        raise ValueError(f"Invalid --where expression: {expr!r} -> {replaced!r} ({e})")
+
+
+def _safe_eval_bool(node: ast.AST) -> Any:
+    """Safely evaluate a restricted boolean expression AST."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_bool(node.body)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Tuple):
+        return tuple(_safe_eval_bool(elt) for elt in node.elts)
+    if isinstance(node, ast.List):
+        return [_safe_eval_bool(elt) for elt in node.elts]
+    if isinstance(node, ast.Set):
+        return {_safe_eval_bool(elt) for elt in node.elts}
+    if isinstance(node, ast.Dict):
+        return {
+            _safe_eval_bool(k): _safe_eval_bool(v)
+            for k, v in zip(node.keys or [], node.values or [])
+            if k is not None
+        }
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _safe_eval_bool(node.operand)
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return all(_safe_eval_bool(v) for v in node.values)
+        if isinstance(node.op, ast.Or):
+            return any(_safe_eval_bool(v) for v in node.values)
+    if isinstance(node, ast.Compare):
+        left = _safe_eval_bool(node.left)
+        for op, comparator in zip(node.ops, node.comparators):
+            right = _safe_eval_bool(comparator)
+            if isinstance(op, ast.Eq):
+                ok = left == right
+            elif isinstance(op, ast.NotEq):
+                ok = left != right
+            elif isinstance(op, ast.Lt):
+                ok = left < right
+            elif isinstance(op, ast.LtE):
+                ok = left <= right
+            elif isinstance(op, ast.Gt):
+                ok = left > right
+            elif isinstance(op, ast.GtE):
+                ok = left >= right
+            elif isinstance(op, ast.In):
+                ok = left in right
+            elif isinstance(op, ast.NotIn):
+                ok = left not in right
+            else:
+                raise ValueError(f"Unsupported comparison operator: {type(op).__name__}")
+            if not ok:
+                return False
+            left = right
+        return True
+    raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+
+
+def count_field_freq(path: Path, field: str, where: Optional[str] = None) -> Counter:
     """Count frequencies of field values."""
     counts: Counter = Counter()
     with path.open(newline="", encoding="utf-8") as f:
@@ -146,6 +222,8 @@ def count_field_freq(path: Path, field: str) -> Counter:
         if reader.fieldnames is None or field not in reader.fieldnames:
             raise ValueError(f"Field '{field}' not found in input header: {reader.fieldnames}")
         for row in reader:
+            if where and not _bool_from_row_expression(where, row):
+                continue
             counts[row[field]] += 1
     return counts
 
@@ -159,11 +237,48 @@ def in_range(freq: int, min_freq: Optional[int], max_freq: Optional[int]) -> boo
     return True
 
 
-def count_input_rows(input_path: Path) -> int:
+def percentile_to_frequency_cutoff(counts: Counter, percentile: int) -> int:
+    """Convert a percentile over unique-value frequencies into a frequency cutoff."""
+    if percentile < 1 or percentile > 100:
+        raise ValueError("Percentiles must be between 1 and 100.")
+    if not counts:
+        return 0
+    sorted_freqs = sorted(counts.values())
+    if len(sorted_freqs) == 1:
+        return sorted_freqs[0]
+    index = round((percentile - 1) * (len(sorted_freqs) - 1) / 99)
+    return sorted_freqs[index]
+
+
+def resolve_frequency_bounds(
+    counts: Counter,
+    min_value: Optional[int],
+    min_mode: str,
+    max_value: Optional[int],
+    max_mode: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    resolved_min = None
+    resolved_max = None
+
+    if min_value is not None:
+        resolved_min = percentile_to_frequency_cutoff(counts, min_value) if min_mode == MODE_PERCENT else min_value
+    if max_value is not None:
+        resolved_max = percentile_to_frequency_cutoff(counts, max_value) if max_mode == MODE_PERCENT else max_value
+    if resolved_min is not None and resolved_max is not None and resolved_min > resolved_max:
+        raise ValueError("Effective minimum frequency cannot be greater than effective maximum frequency.")
+    return resolved_min, resolved_max
+
+
+def count_input_rows(input_path: Path, where: Optional[str] = None) -> int:
     """Count total data rows in input CSV (excluding header)."""
     with input_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        return sum(1 for _ in reader)
+        count = 0
+        for row in reader:
+            if where and not _bool_from_row_expression(where, row):
+                continue
+            count += 1
+        return count
 
 
 def filter_rows(
@@ -173,6 +288,7 @@ def filter_rows(
     counts: Counter,
     min_freq: Optional[int],
     max_freq: Optional[int],
+    where: Optional[str] = None,
 ) -> int:
     """Filter rows and write to output. Returns count of rows written."""
     rows_written = 0
@@ -186,6 +302,8 @@ def filter_rows(
         writer.writeheader()
 
         for row in reader:
+            if where and not _bool_from_row_expression(where, row):
+                continue
             val = row[field]
             if in_range(counts[val], min_freq, max_freq):
                 writer.writerow(row)
@@ -205,13 +323,32 @@ def reconstruct_filter_command(input_csv: str, output_csv: str, args) -> str:
     if args.field != "lemma":
         cmd.extend(["--field", args.field])
     if args.min_freq is not None:
-        cmd.extend(["--min-freq", str(args.min_freq)])
+        min_arg = f"{args.min_freq}%" if getattr(args, "min_mode", MODE_ABSOLUTE) == MODE_PERCENT else str(args.min_freq)
+        cmd.extend(["--min-freq", min_arg])
     if args.max_freq is not None:
-        cmd.extend(["--max-freq", str(args.max_freq)])
+        max_arg = f"{args.max_freq}%" if getattr(args, "max_mode", MODE_ABSOLUTE) == MODE_PERCENT else str(args.max_freq)
+        cmd.extend(["--max-freq", max_arg])
+    if getattr(args, "where", None):
+        cmd.extend(["--where", args.where])
     if args.strict_checksum:
         cmd.append("--strict-checksum")
     
     return " ".join(cmd)
+
+
+def parse_cutoff_arg(raw: Optional[str], label: str) -> Tuple[Optional[int], str]:
+    if raw is None:
+        return None, MODE_ABSOLUTE
+    text = raw.strip()
+    if not text:
+        return None, MODE_ABSOLUTE
+    mode = MODE_PERCENT if text.endswith("%") else MODE_ABSOLUTE
+    numeric_text = text[:-1] if mode == MODE_PERCENT else text
+    try:
+        value = int(numeric_text)
+    except ValueError as exc:
+        raise SystemExit(f"Error: {label} must be an integer or integer followed by %") from exc
+    return value, mode
 
 
 def run_cli() -> None:
@@ -222,11 +359,16 @@ def run_cli() -> None:
     ap.add_argument("input_csv", nargs="?", help="Input verb CSV file")
     ap.add_argument("output_csv", nargs="?", help="Output filtered CSV file")
     ap.add_argument("--field", choices=["lemma", "surface_lower"], help="Field to filter by")
-    ap.add_argument("--min-freq", type=int, help="Keep values with freq >= min_freq")
-    ap.add_argument("--max-freq", type=int, help="Keep values with freq <= max_freq")
+    ap.add_argument("--min-freq", help="Keep values with freq >= min_freq; append % for percentile mode")
+    ap.add_argument("--max-freq", help="Keep values with freq <= max_freq; append % for percentile mode")
+    ap.add_argument("--where", help="Row filter expression using {{column}} placeholders")
     ap.add_argument("--load-metadata", help="Load settings from metadata JSON (CLI args override)")
     ap.add_argument("--strict-checksum", action="store_true", help="Abort if input file checksum mismatches metadata (CLI only)")
     args = ap.parse_args()
+    cli_min_specified = args.min_freq is not None
+    cli_max_specified = args.max_freq is not None
+    args.min_freq, args.min_mode = parse_cutoff_arg(args.min_freq, "--min-freq")
+    args.max_freq, args.max_mode = parse_cutoff_arg(args.max_freq, "--max-freq")
 
     # Load metadata if provided
     metadata = None
@@ -263,10 +405,14 @@ def run_cli() -> None:
         # Use loaded settings as defaults, CLI args override
         if not args.field:
             args.field = metadata.get("settings", {}).get("field", "lemma")
-        if args.min_freq is None:
+        if not cli_min_specified:
             args.min_freq = metadata.get("settings", {}).get("min_freq")
-        if args.max_freq is None:
+            args.min_mode = metadata.get("settings", {}).get("min_mode", MODE_ABSOLUTE)
+        if not cli_max_specified:
             args.max_freq = metadata.get("settings", {}).get("max_freq")
+            args.max_mode = metadata.get("settings", {}).get("max_mode", MODE_ABSOLUTE)
+        if not args.where:
+            args.where = metadata.get("settings", {}).get("where")
     
     # Validate required arguments
     if not args.input_csv or not args.output_csv:
@@ -283,8 +429,12 @@ def run_cli() -> None:
         raise SystemExit("Error: --min-freq must be >= 1")
     if args.max_freq is not None and args.max_freq < 1:
         raise SystemExit("Error: --max-freq must be >= 1")
-    if args.min_freq is not None and args.max_freq is not None and args.min_freq > args.max_freq:
-        raise SystemExit("Error: --min-freq cannot be greater than --max-freq")
+    if args.min_mode == MODE_PERCENT and args.min_freq is not None and args.min_freq > 100:
+        raise SystemExit("Error: percentile minimum must be between 1 and 100")
+    if args.max_mode == MODE_PERCENT and args.max_freq is not None and args.max_freq > 100:
+        raise SystemExit("Error: percentile maximum must be between 1 and 100")
+    if args.min_freq is not None and args.max_freq is not None and args.min_freq > args.max_freq and args.min_mode == args.max_mode:
+        raise SystemExit("Error: minimum cannot be greater than maximum")
     
     input_path = Path(args.input_csv)
     output_path = Path(args.output_csv)
@@ -328,10 +478,11 @@ def run_cli() -> None:
     
     # Filter
     print(f"Counting frequencies for field '{args.field}'...")
-    counts = count_field_freq(input_path, args.field)
+    counts = count_field_freq(input_path, args.field, args.where)
+    min_cutoff, max_cutoff = resolve_frequency_bounds(counts, args.min_freq, args.min_mode, args.max_freq, args.max_mode)
     
     print("Counting input rows...")
-    total_input_rows = count_input_rows(input_path)
+    total_input_rows = count_input_rows(input_path, args.where)
     
     print("Filtering and writing output...")
     rows_written = filter_rows(
@@ -339,8 +490,9 @@ def run_cli() -> None:
         output_path,
         args.field,
         counts,
-        args.min_freq,
-        args.max_freq,
+        min_cutoff,
+        max_cutoff,
+        args.where,
     )
     
     rows_filtered = total_input_rows - rows_written
@@ -353,6 +505,9 @@ def run_cli() -> None:
         "field": args.field,
         "min_freq": args.min_freq,
         "max_freq": args.max_freq,
+        "min_mode": args.min_mode,
+        "max_mode": args.max_mode,
+        "where": args.where,
     }
     
     stats = {
@@ -380,6 +535,8 @@ def run_gui() -> None:
         from PySide6.QtCore import QThread, Signal, QSize
         from PySide6.QtWidgets import (
             QApplication,
+            QButtonGroup,
+            QCheckBox,
             QMainWindow,
             QWidget,
             QVBoxLayout,
@@ -387,6 +544,7 @@ def run_gui() -> None:
             QGroupBox,
             QLabel,
             QLineEdit,
+            QRadioButton,
             QSpinBox,
             QComboBox,
             QPushButton,
@@ -414,6 +572,9 @@ def run_gui() -> None:
             field: str,
             min_freq: Optional[int],
             max_freq: Optional[int],
+            min_mode: str,
+            max_mode: str,
+            where: Optional[str],
             source_metadata: Optional[Dict] = None,
         ):
             super().__init__()
@@ -422,6 +583,9 @@ def run_gui() -> None:
             self.field = field
             self.min_freq = min_freq
             self.max_freq = max_freq
+            self.min_mode = min_mode
+            self.max_mode = max_mode
+            self.where = where
             self.source_metadata = source_metadata
             self._stop_requested = False
         
@@ -433,11 +597,14 @@ def run_gui() -> None:
             """Run the filtering in the worker thread."""
             try:
                 self.progress_update.emit(f"Counting frequencies for field '{self.field}'...")
-                counts = count_field_freq(self.input_path, self.field)
+                counts = count_field_freq(self.input_path, self.field, self.where)
+                min_cutoff, max_cutoff = resolve_frequency_bounds(
+                    counts, self.min_freq, self.min_mode, self.max_freq, self.max_mode
+                )
                 
                 self.progress_update.emit(f"Found {len(counts)} unique values")
                 self.progress_update.emit("Counting input rows...")
-                total_input_rows = count_input_rows(self.input_path)
+                total_input_rows = count_input_rows(self.input_path, self.where)
                 self.progress_update.emit(f"Total input rows: {total_input_rows}")
                 
                 self.progress_update.emit("Filtering and writing output...")
@@ -447,8 +614,9 @@ def run_gui() -> None:
                     self.output_path,
                     self.field,
                     counts,
-                    self.min_freq,
-                    self.max_freq,
+                    min_cutoff,
+                    max_cutoff,
+                    self.where,
                 )
                 
                 rows_filtered = total_input_rows - rows_written
@@ -461,6 +629,9 @@ def run_gui() -> None:
                     "field": self.field,
                     "min_freq": self.min_freq,
                     "max_freq": self.max_freq,
+                    "min_mode": self.min_mode,
+                    "max_mode": self.max_mode,
+                    "where": self.where,
                 }
                 
                 stats = {
@@ -476,8 +647,14 @@ def run_gui() -> None:
                     gui_cmd.extend(["--field", self.field])
                 if self.min_freq is not None:
                     gui_cmd.extend(["--min-freq", str(self.min_freq)])
+                if self.min_mode != MODE_ABSOLUTE:
+                    gui_cmd.extend(["--min-mode", self.min_mode])
                 if self.max_freq is not None:
                     gui_cmd.extend(["--max-freq", str(self.max_freq)])
+                if self.max_mode != MODE_ABSOLUTE:
+                    gui_cmd.extend(["--max-mode", self.max_mode])
+                if self.where:
+                    gui_cmd.extend(["--where", self.where])
                 command = " ".join(gui_cmd)
                 
                 save_filter_metadata(self.output_path, self.input_path, input_checksum, output_checksum, filter_args, stats, self.source_metadata, command=command)
@@ -568,10 +745,19 @@ def run_gui() -> None:
             min_layout = QVBoxLayout()
             min_label = QLabel("Min Frequency:")
             self.min_spin = QSpinBox()
-            self.min_spin.setMinimum(0)
+            self.min_spin.setMinimum(1)
             self.min_spin.setMaximum(1000000)
             self.min_spin.setValue(1)
+            min_mode_layout = QHBoxLayout()
+            self.min_abs_radio = QRadioButton("Absolute")
+            self.min_pct_radio = QRadioButton("Percent")
+            self.min_abs_radio.setChecked(True)
+            self.min_abs_radio.toggled.connect(self.update_frequency_mode_controls)
+            self.min_pct_radio.toggled.connect(self.update_frequency_mode_controls)
+            min_mode_layout.addWidget(self.min_abs_radio)
+            min_mode_layout.addWidget(self.min_pct_radio)
             min_layout.addWidget(min_label)
+            min_layout.addLayout(min_mode_layout)
             min_layout.addWidget(self.min_spin)
             
             max_layout = QVBoxLayout()
@@ -580,16 +766,33 @@ def run_gui() -> None:
             self.max_spin.setMinimum(0)
             self.max_spin.setMaximum(10000000)
             self.max_spin.setValue(0)  # 0 = no limit
+            self.max_spin.setSpecialValueText("None")
+            max_mode_layout = QHBoxLayout()
+            self.max_abs_radio = QRadioButton("Absolute")
+            self.max_pct_radio = QRadioButton("Percent")
+            self.max_abs_radio.setChecked(True)
+            self.max_abs_radio.toggled.connect(self.update_frequency_mode_controls)
+            self.max_pct_radio.toggled.connect(self.update_frequency_mode_controls)
+            max_mode_layout.addWidget(self.max_abs_radio)
+            max_mode_layout.addWidget(self.max_pct_radio)
             max_layout.addWidget(max_label)
+            max_layout.addLayout(max_mode_layout)
             max_layout.addWidget(self.max_spin)
             
             freq_layout.addLayout(min_layout)
             freq_layout.addLayout(max_layout)
             freq_layout.addStretch()
             settings_layout.addLayout(freq_layout)
+
+            where_layout = QHBoxLayout()
+            where_layout.addWidget(QLabel("Row Filter ({{col}} syntax):"))
+            self.where_edit = QLineEdit()
+            where_layout.addWidget(self.where_edit)
+            settings_layout.addLayout(where_layout)
             
             settings_group.setLayout(settings_layout)
             layout.addWidget(settings_group)
+            self.update_frequency_mode_controls()
             
             # Progress section
             progress_group = QGroupBox("Progress")
@@ -669,6 +872,12 @@ def run_gui() -> None:
                     self.field_combo.setCurrentText(settings.get("field", "lemma"))
                     self.min_spin.setValue(settings.get("min_freq") or 1)
                     self.max_spin.setValue(settings.get("max_freq") or 0)
+                    self.min_pct_radio.setChecked(settings.get("min_mode") == MODE_PERCENT)
+                    self.min_abs_radio.setChecked(settings.get("min_mode", MODE_ABSOLUTE) == MODE_ABSOLUTE)
+                    self.max_pct_radio.setChecked(settings.get("max_mode") == MODE_PERCENT)
+                    self.max_abs_radio.setChecked(settings.get("max_mode", MODE_ABSOLUTE) == MODE_ABSOLUTE)
+                    self.where_edit.setText(settings.get("where") or "")
+                    self.update_frequency_mode_controls()
                     # Preserve source metadata for chaining
                     self.source_metadata = metadata.get("source_metadata")
                     self.log(f"✓ Loaded filter settings from: {json_path}")
@@ -695,6 +904,20 @@ def run_gui() -> None:
             self.log_text.verticalScrollBar().setValue(
                 self.log_text.verticalScrollBar().maximum()
             )
+
+        def update_frequency_mode_controls(self):
+            if self.min_pct_radio.isChecked():
+                self.min_spin.setMaximum(100)
+            else:
+                self.min_spin.setMaximum(1000000)
+            if self.max_pct_radio.isChecked():
+                self.max_spin.setMaximum(100)
+                if self.max_spin.value() == 0:
+                    self.max_spin.setSpecialValueText("None")
+            else:
+                self.max_spin.setMaximum(10000000)
+                if self.max_spin.value() == 0:
+                    self.max_spin.setSpecialValueText("None")
         
         def start_filtering(self):
             """Start the filtering process."""
@@ -711,6 +934,21 @@ def run_gui() -> None:
             
             if not input_path.exists():
                 QMessageBox.critical(self, "Error", f"Input file not found: {input_path}")
+                return
+
+            min_mode = MODE_PERCENT if self.min_pct_radio.isChecked() else MODE_ABSOLUTE
+            max_mode = MODE_PERCENT if self.max_pct_radio.isChecked() else MODE_ABSOLUTE
+            min_value = self.min_spin.value()
+            max_value = self.max_spin.value() if self.max_spin.value() > 0 else None
+
+            if min_mode == MODE_PERCENT and not (1 <= min_value <= 100):
+                QMessageBox.critical(self, "Error", "Minimum percentile must be between 1 and 100.")
+                return
+            if max_mode == MODE_PERCENT and max_value is not None and not (1 <= max_value <= 100):
+                QMessageBox.critical(self, "Error", "Maximum percentile must be between 1 and 100.")
+                return
+            if max_value is not None and min_mode == max_mode and min_value > max_value:
+                QMessageBox.critical(self, "Error", "Minimum cannot be greater than maximum.")
                 return
             
             try:
@@ -741,8 +979,9 @@ def run_gui() -> None:
             self.log(f"Input: {input_path}")
             self.log(f"Output: {output_path}")
             self.log(f"Field: {self.field_combo.currentText()}")
-            self.log(f"Min frequency: {self.min_spin.value() if self.min_spin.value() > 0 else 'None'}")
-            self.log(f"Max frequency: {self.max_spin.value() if self.max_spin.value() > 0 else 'None'}")
+            self.log(f"Min frequency: {min_value} ({min_mode})")
+            self.log(f"Max frequency: {max_value if max_value is not None else 'None'} ({max_mode})")
+            self.log(f"Where: {self.where_edit.text().strip() or 'None'}")
             self.log("")
             
             # Disable controls
@@ -756,8 +995,11 @@ def run_gui() -> None:
                 input_path,
                 output_path,
                 self.field_combo.currentText(),
-                self.min_spin.value() if self.min_spin.value() > 0 else None,
-                self.max_spin.value() if self.max_spin.value() > 0 else None,
+                min_value,
+                max_value,
+                min_mode,
+                max_mode,
+                self.where_edit.text().strip() or None,
                 self.source_metadata,
             )
             

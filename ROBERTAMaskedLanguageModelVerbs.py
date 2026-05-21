@@ -7,7 +7,7 @@ Supports both CLI and GUI modes:
   - Run with arguments: uses CLI mode
 
 For each row:
-  - read sentence + span_in_sentence_char (format "start-end")
+  - read sentence/span_in_sentence_char or context/span_in_context
   - replace that character span with RoBERTa's mask token (<mask>)
   - run masked language model inference
   - write the original row plus 2*top_k new columns:
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import logging
@@ -48,7 +49,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional, Set
+from typing import Any, Callable, Dict, List, Tuple, Optional, Set
 
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
@@ -169,13 +170,26 @@ def load_mlm_metadata(json_path: Path) -> Any:
         return json.load(f)
 
 
+def get_expected_input_checksum(metadata: Dict) -> Tuple[Optional[str], str]:
+    """Return the checksum the current MLM input should match.
+
+    When chaining from an upstream tool, the MLM input is that tool's output,
+    not that tool's original input. Existing MLM metadata is the exception:
+    it should still verify against the saved MLM input checksum.
+    """
+    tool_name = metadata.get("tool", "unknown")
+    if tool_name in {"FilterSpaCyVerbs", "filterSpaCyVerbs", "SpaCyVerbExtractor"}:
+        return metadata.get("output_checksum"), f"{tool_name} output"
+    return metadata.get("input_checksum"), "metadata input"
+
+
 def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
     """
     Verify input file checksum against metadata.
     
     Returns (matches: bool, message: str)
     """
-    expected_checksum = metadata.get("input_checksum")
+    expected_checksum, expected_source = get_expected_input_checksum(metadata)
     if not expected_checksum:
         return True, "No checksum in metadata"
     
@@ -184,9 +198,9 @@ def verify_input_checksum(input_path: Path, metadata: Dict) -> Tuple[bool, str]:
     
     actual_checksum = compute_file_md5(input_path)
     if actual_checksum != expected_checksum:
-        return False, f"Input file has changed (checksum mismatch): {input_path}"
+        return False, f"Input file has changed (checksum mismatch vs {expected_source}): {input_path}"
     
-    return True, "Input file verified (checksum OK)"
+    return True, f"Input file verified against {expected_source} (checksum OK)"
 
 
 # ============================================================================
@@ -210,6 +224,19 @@ def mask_sentence(sentence: str, span_str: str, mask_token: str) -> str:
     return sentence[:start] + mask_token + sentence[end:]
 
 
+def resolve_context_columns(fieldnames: List[str]) -> Tuple[str, str]:
+    """Pick the available text/span column pair, preferring the legacy names."""
+    fieldname_set = set(fieldnames)
+    if {"sentence", "span_in_sentence_char"} <= fieldname_set:
+        return "sentence", "span_in_sentence_char"
+    if {"context", "span_in_context"} <= fieldname_set:
+        return "context", "span_in_context"
+    raise ValueError(
+        "Input CSV must include either "
+        "('sentence', 'span_in_sentence_char') or ('context', 'span_in_context')."
+    )
+
+
 def decode_token(tokenizer, token_id: int) -> str:
     # For RoBERTa, decoding a single token id may include a leading space.
     decoded: str = tokenizer.decode([token_id], clean_up_tokenization_spaces=False).strip()
@@ -227,44 +254,139 @@ def topk_for_batch(
     Returns per-text list of (decoded_token, probability) length top_k.
     Assumes each text contains exactly one mask token.
     """
-    enc = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(device)
+    enc = None
+    out = None
+    mask_logits = None
+    probs = None
+    top_probs = None
+    top_ids = None
+    try:
+        enc = tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(device)
 
-    with torch.no_grad():
-        out = model(**enc)
-        logits = out.logits  # [B, T, V]
+        mask_id = tokenizer.mask_token_id
+        input_ids = enc["input_ids"]  # [B, T]
+        mask_positions = (input_ids == mask_id).nonzero(as_tuple=False)  # [N, 2] with (b, t)
 
-    mask_id = tokenizer.mask_token_id
-    input_ids = enc["input_ids"]  # [B, T]
-    mask_positions = (input_ids == mask_id).nonzero(as_tuple=False)  # [N, 2] with (b, t)
+        B = input_ids.size(0)
+        mask_index: List[Optional[int]] = [None] * B
+        for b, t in mask_positions.tolist():
+            if mask_index[b] is None:
+                mask_index[b] = t
 
-    B = input_ids.size(0)
-    mask_index: List[Optional[int]] = [None] * B
-    for b, t in mask_positions.tolist():
-        if mask_index[b] is None:
-            mask_index[b] = t
+        results: List[List[Tuple[str, float]]] = [[("", 0.0)] * top_k for _ in range(B)]
+        valid_rows = [i for i, t in enumerate(mask_index) if t is not None]
+        if not valid_rows:
+            return results
 
-    results: List[List[Tuple[str, float]]] = []
-    for b in range(B):
-        t = mask_index[b]
-        if t is None:
-            results.append([("", 0.0)] * top_k)
-            continue
+        row_index = torch.tensor(valid_rows, device=device)
+        token_index = torch.tensor([mask_index[i] for i in valid_rows], device=device)
 
-        vocab_logits = logits[b, t, :]  # [V]
-        probs = torch.softmax(vocab_logits, dim=-1)
-        top_probs, top_ids = torch.topk(probs, k=top_k)
+        with torch.inference_mode():
+            out = model(**enc)
+            # Keep only the logits at the mask token positions. This drops the
+            # large [batch, sequence, vocab] tensor before decoding results.
+            mask_logits = out.logits[row_index, token_index, :]
+            probs = torch.softmax(mask_logits, dim=-1)
+            top_probs, top_ids = torch.topk(probs, k=top_k, dim=-1)
 
-        row: List[Tuple[str, float]] = []
-        for pid, p in zip(top_ids.tolist(), top_probs.tolist()):
-            row.append((decode_token(tokenizer, pid).lower(), float(p)))
-        results.append(row)
+        top_probs_list = top_probs.detach().cpu().tolist()
+        top_ids_list = top_ids.detach().cpu().tolist()
 
-    return results
+        for row_num, ids, probabilities in zip(valid_rows, top_ids_list, top_probs_list):
+            results[row_num] = [
+                (decode_token(tokenizer, int(pid)).lower(), float(probability))
+                for pid, probability in zip(ids, probabilities)
+            ]
+
+        return results
+    finally:
+        del top_ids, top_probs, probs, mask_logits, out, enc
+        clear_device_memory(device)
+
+
+def is_insufficient_memory_error(exc: BaseException) -> bool:
+    """Detect common PyTorch CUDA/MPS/CPU allocation failures."""
+    torch_oom_error = getattr(torch, "OutOfMemoryError", None)
+    if torch_oom_error is not None and isinstance(exc, torch_oom_error):
+        return True
+
+    message = str(exc).lower()
+    memory_markers = (
+        "out of memory",
+        "not enough memory",
+        "can't allocate memory",
+        "cannot allocate memory",
+        "allocation failed",
+        "mps backend out of memory",
+        "defaultcpuallocator",
+    )
+    return any(marker in message for marker in memory_markers)
+
+
+def clear_device_memory(device: torch.device) -> None:
+    """Release cached allocator memory after an OOM before retrying a smaller batch."""
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def topk_for_batch_with_memory_retry(
+    model,
+    tokenizer,
+    texts: List[str],
+    top_k: int,
+    device: torch.device,
+    logger: Optional[logging.Logger] = None,
+    message_callback: Optional[Callable[[str], None]] = None,
+) -> List[List[Tuple[str, float]]]:
+    """
+    Run inference, splitting the batch on memory failures.
+
+    A single-row memory failure is re-raised because there is no smaller batch to try.
+    """
+    try:
+        return topk_for_batch(model, tokenizer, texts, top_k, device)
+    except RuntimeError as exc:
+        if not is_insufficient_memory_error(exc) or len(texts) <= 1:
+            raise
+
+        clear_device_memory(device)
+        midpoint = len(texts) // 2
+        message = (
+            f"Insufficient memory for batch of {len(texts)} rows on {device}; "
+            f"retrying as {midpoint} + {len(texts) - midpoint} rows."
+        )
+        if logger:
+            logger.warning(message)
+        if message_callback:
+            message_callback(message)
+
+        left = topk_for_batch_with_memory_retry(
+            model,
+            tokenizer,
+            texts[:midpoint],
+            top_k,
+            device,
+            logger=logger,
+            message_callback=message_callback,
+        )
+        right = topk_for_batch_with_memory_retry(
+            model,
+            tokenizer,
+            texts[midpoint:],
+            top_k,
+            device,
+            logger=logger,
+            message_callback=message_callback,
+        )
+        return left + right
 
 
 @dataclass
@@ -408,8 +530,6 @@ def run_cli() -> None:
     for i in range(1, args.top_k + 1):
         pred_cols.extend([f"token_{i}", f"prob_{i}"])
 
-    needed_cols = {"sentence", "span_in_sentence_char"}
-
     processed = 0
     skipped = 0
     seen = 0
@@ -436,10 +556,10 @@ def run_cli() -> None:
             reader = csv.DictReader(fin)
             if reader.fieldnames is None:
                 raise SystemExit("Input CSV has no header.")
-
-            missing = needed_cols - set(reader.fieldnames)
-            if missing:
-                raise SystemExit(f"Input CSV missing required columns: {sorted(missing)}")
+            try:
+                text_col, span_col = resolve_context_columns(list(reader.fieldnames))
+            except ValueError as exc:
+                raise SystemExit(str(exc))
 
             out_fieldnames = list(reader.fieldnames) + pred_cols
             writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
@@ -453,7 +573,14 @@ def run_cli() -> None:
                     for i, t in enumerate(texts[: min(len(texts), 5)], start=1):
                         logger.debug(f"Masked[{i}/{len(texts)}]: {t}")
 
-                preds = topk_for_batch(model, tokenizer, texts, args.top_k, dev)
+                preds = topk_for_batch_with_memory_retry(
+                    model,
+                    tokenizer,
+                    texts,
+                    args.top_k,
+                    dev,
+                    logger=logger,
+                )
 
                 for pr, pr_preds in zip(batch, preds):
                     out_row = dict(pr.row)
@@ -474,8 +601,8 @@ def run_cli() -> None:
                     break
 
                 try:
-                    raw_sent = row["sentence"]
-                    span = row["span_in_sentence_char"]
+                    raw_sent = row[text_col]
+                    span = row[span_col]
 
                     masked_raw = mask_sentence(raw_sent, span, mask_token)
                     masked = " " + masked_raw.strip()
@@ -632,6 +759,9 @@ def run_gui() -> None:
         
         def run(self):
             """Run the MLM inference in the worker thread."""
+            dev = None
+            tokenizer = None
+            model = None
             try:
                 # Device selection
                 if self.device_name and self.device_name != "auto":
@@ -661,7 +791,6 @@ def run_gui() -> None:
                 for i in range(1, self.top_k + 1):
                     pred_cols.extend([f"token_{i}", f"prob_{i}"])
                 
-                needed_cols = {"sentence", "span_in_sentence_char"}
                 processed = 0
                 skipped = 0
                 seen = 0
@@ -682,10 +811,7 @@ def run_gui() -> None:
                     reader = csv.DictReader(fin)
                     if reader.fieldnames is None:
                         raise ValueError("Input CSV has no header")
-                    
-                    missing = needed_cols - set(reader.fieldnames)
-                    if missing:
-                        raise ValueError(f"Missing required columns: {sorted(missing)}")
+                    text_col, span_col = resolve_context_columns(list(reader.fieldnames))
                     
                     out_fieldnames = list(reader.fieldnames) + pred_cols
                     writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
@@ -694,7 +820,14 @@ def run_gui() -> None:
                     def flush_batch(batch: List[PendingRow]) -> None:
                         nonlocal processed
                         texts = [pr.masked_text for pr in batch]
-                        preds = topk_for_batch(model, tokenizer, texts, self.top_k, dev)
+                        preds = topk_for_batch_with_memory_retry(
+                            model,
+                            tokenizer,
+                            texts,
+                            self.top_k,
+                            dev,
+                            message_callback=self.progress_update.emit,
+                        )
                         
                         for pr, pr_preds in zip(batch, preds):
                             out_row = dict(pr.row)
@@ -715,8 +848,8 @@ def run_gui() -> None:
                             break
                         
                         try:
-                            raw_sent = row["sentence"]
-                            span = row["span_in_sentence_char"]
+                            raw_sent = row[text_col]
+                            span = row[span_col]
                             masked_raw = mask_sentence(raw_sent, span, mask_token)
                             masked = " " + masked_raw.strip()
                             pending.append(PendingRow(row=row, masked_text=masked))
@@ -819,6 +952,10 @@ def run_gui() -> None:
             except Exception as e:
                 self.progress_update.emit(f"✗ Error: {str(e)}")
                 self.finished.emit(False, f"Error: {str(e)}")
+            finally:
+                del model, tokenizer
+                if dev is not None:
+                    clear_device_memory(dev)
 
     class MLMInferenceGUI(QMainWindow):
         """Main GUI window for MLM inference tool."""
@@ -961,6 +1098,7 @@ def run_gui() -> None:
             self.log_text = QTextEdit()
             self.log_text.setReadOnly(True)
             self.log_text.setMaximumHeight(200)
+            self.log_text.document().setMaximumBlockCount(2000)
             progress_layout.addWidget(self.log_text)
             
             progress_group.setLayout(progress_layout)
