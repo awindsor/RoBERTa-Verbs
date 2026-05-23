@@ -285,17 +285,27 @@ def topk_for_batch(
 
         row_index = torch.tensor(valid_rows, device=device)
         token_index = torch.tensor([mask_index[i] for i in valid_rows], device=device)
+        del input_ids, mask_positions
 
         with torch.inference_mode():
             out = model(**enc)
             # Keep only the logits at the mask token positions. This drops the
             # large [batch, sequence, vocab] tensor before decoding results.
             mask_logits = out.logits[row_index, token_index, :]
+            del out, enc
+            out = None
+            enc = None
             probs = torch.softmax(mask_logits, dim=-1)
             top_probs, top_ids = torch.topk(probs, k=top_k, dim=-1)
 
         top_probs_list = top_probs.detach().cpu().tolist()
         top_ids_list = top_ids.detach().cpu().tolist()
+        del top_ids, top_probs, probs, mask_logits
+        top_ids = None
+        top_probs = None
+        probs = None
+        mask_logits = None
+        clear_device_memory(device)
 
         for row_num, ids, probabilities in zip(valid_rows, top_ids_list, top_probs_list):
             results[row_num] = [
