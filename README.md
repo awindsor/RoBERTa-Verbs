@@ -1,424 +1,307 @@
-# RoBERTa Verbs Analysis Workflow
+# RoBERTa Verbs
 
-A comprehensive pipeline for extracting verbs from text, computing masked language model predictions using RoBERTa, and organizing results by semantic verb groups.
+A script-based pipeline for extracting verbs from text, running RoBERTa masked-language-model inference over those verbs in context, mapping MLM predictions to semantic verb groups, and aggregating the results.
 
-## Overview
+Most tools support a command-line mode. Several of the larger tools also launch a PySide6 GUI when run with no arguments.
 
-This workflow enables analyzing verb usage patterns and semantic relationships by:
-1. Extracting verbs from raw text using spaCy
-2. Running RoBERTa masked-language-model (MLM) inference to get contextual predictions
-3. Organizing predictions into semantic verb groups
-4. Computing aggregated statistics by lemma and group
+## Installation
 
-## Core Components
+Use the project environment if available:
 
-### Phase 1: Verb Extraction
+```bash
+uv sync
+```
 
-#### [SpaCyVerbExtractor.py](SpaCyVerbExtractor.py)
-Extracts verbs from raw text documents using spaCy NLP pipeline. Supports both CLI and GUI modes with run reconstruction via metadata.
+Or install the main dependencies manually:
 
-**Features:**
-- Chunked processing with overlapping character windows (prevents sentence boundary loss)
-- Handles multiple input files via CLI or paths file
-- Deduplicates sentences across chunk overlaps
-- Outputs lemma, surface form, character span, and full sentence
-- **Batch processing with `nlp.pipe()`** – Uses multiple CPU cores for 30-50% speed improvement
-- **Auto-download models** – Automatically downloads spaCy models if not found locally
-- **Hybrid progress tracking** – Visual progress bar + file count + data volume info
-- **Generates JSON metadata** with MD5 checksums for complete run reconstruction
-- **Supports loading previous run settings** from JSON metadata
+```bash
+pip install spacy transformers torch lemminflect openpyxl PySide6 tqdm
+python -m spacy download en_core_web_sm
+```
 
-**Output Files:**
-- CSV/TSV file with extracted verbs
-- `.json` metadata file containing:
-  - All extraction settings (model, chunk size, encoding, etc.)
-  - MD5 checksums of input and output files
-  - Extraction statistics (documents, chunks, sentences, verbs)
-  - Timestamp of extraction
+Optional transformer spaCy model support is defined in `pyproject.toml` under the `transformer-model` extra.
 
-**Output Columns:**
-- `doc_path`, `chunk_start_char`, `sent_start_char_in_doc`, `sent_index_in_doc_approx`
-- `token_index_in_sent`, `lemma`, `surface_lower`, `span_in_sentence_char`, `sentence`
+## Main Workflow
 
-**Usage (GUI):**
+```text
+Raw text or CSV text column
+  -> SpaCyVerbExtractor.py
+  -> FilterSpaCyVerbs.py or randomSampleCSV.py
+  -> RoBERTaMaskedLanguageModelVerbs.py
+  -> MLMGroupAggregator.py
+  -> LemmaToGroupProbs.py
+```
+
+Typical CLI run:
+
+```bash
+python SpaCyVerbExtractor.py --paths-file filepaths.txt --output verbs.csv
+python FilterSpaCyVerbs.py verbs.csv verbs_min20.csv --field lemma --min-freq 20
+python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --model roberta-base --batch-size 8 --top-k 10 --device mps
+python MLMGroupAggregator.py verbs_mlm.csv groups.csv verbs_mlm_groups.csv
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.xlsx --auto-groups
+```
+
+Metadata JSON files are written beside outputs where supported. The metadata records settings, source files, checksums, statistics, and reconstructed commands for reproducibility.
+
+## Scripts
+
+### `SpaCyVerbExtractor.py`
+
+Extracts verbs from text files, path lists, or a CSV text column.
+
+GUI:
+
 ```bash
 python SpaCyVerbExtractor.py
-# In GUI: 
-#  - Add files or paths file
-#  - Select model (en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf)
-#  - Models auto-download if missing
-#  - Monitor progress bar + detailed log output
-#  - Load settings from previous run
 ```
 
-**Usage (CLI):**
+CLI:
+
 ```bash
-# Basic extraction (model auto-downloads if needed)
-python SpaCyVerbExtractor.py input.txt -o verbs.csv
-
-# Multiple files
-python SpaCyVerbExtractor.py file1.txt file2.txt -o verbs.csv
-
-# With paths file
-python SpaCyVerbExtractor.py --paths-file paths.txt -o verbs.tsv --tsv --include-aux
-
-# Specify model (auto-downloads if missing)
-python SpaCyVerbExtractor.py input.txt -o verbs.csv --model en_core_web_lg
-
-# Load settings from previous run (CLI options override)
-python SpaCyVerbExtractor.py --load-metadata verbs.json input.txt -o verbs2.csv
-
-# Reconstruct exact run
-python SpaCyVerbExtractor.py --load-metadata verbs.json
+python SpaCyVerbExtractor.py input.txt --output verbs.csv
+python SpaCyVerbExtractor.py file1.txt file2.txt --output verbs.csv --include-aux
+python SpaCyVerbExtractor.py --paths-file filepaths.txt --output verbs.tsv --tsv
+python SpaCyVerbExtractor.py input.csv --csv-text-column text --include-csv-fields --output verbs.csv
+python SpaCyVerbExtractor.py --load-metadata verbs.json input.txt --output verbs_rerun.csv
 ```
 
-**Available Models:**
-- `en_core_web_sm` – Fast, small (~12 MB)
-- `en_core_web_md` – Balanced (~40 MB)
-- `en_core_web_lg` – Slower, accurate (~600 MB)
-- `en_core_web_trf` – Transformer-based, highest accuracy (~650 MB)
+Current options:
 
-**Metadata Features:**
-- **Verification:** CLI and GUI verify input file checksums against saved metadata
-- **Override:** CLI command-line arguments override loaded settings
-- **GUI Changes:** GUI allows changing any settings after loading metadata
-- **Filename:** Metadata JSON has same base name as output (e.g., `verbs.csv` → `verbs.json`)
-- **Model Recording:** JSON records the exact model used for reproducibility
+- Inputs: positional `paths`, `--paths-file`
+- Output: `--output`, `--tsv`
+- CSV input: `--csv-text-column`, `--include-csv-fields`
+- NLP settings: `--model`, `--encoding`, `--include-aux`, `--chunk-size`, `--overlap`
+- Runtime/logging: `--dedupe-window`, `--heartbeat-chunks`, `--log-level`
+- Reproducibility: `--load-metadata`
 
-**Performance:**
-- Batch processing uses multi-core processing via spaCy's `nlp.pipe()`
-- Processes chunks in batches of 32 for efficiency
-- Progress bar shows overall completion and data volume
+Important output columns include `lemma`, `surface_lower`, `context`, `span_in_context`, and source-document location fields. Older downstream code may also accept `sentence` and `span_in_sentence_char`.
 
-**Requirements:**
+### `SpaCyVerbCounter.py`
+
+Counts extracted verb values.
+
 ```bash
-pip install spacy transformers torch lemminflect openpyxl PySide6
-# Models auto-download on first use, or manually:
-# python -m spacy download en_core_web_sm
-# python -m spacy download en_core_web_trf
+python SpaCyVerbCounter.py verbs.csv lemma_counts.csv --field lemma
+python SpaCyVerbCounter.py verbs.csv surface_counts.csv --field surface_lower
 ```
 
----
+### `FilterSpaCyVerbs.py`
 
-#### [SpaCyVerbCounter.py](SpaCyVerbCounter.py)
-Aggregates verb frequencies from extraction output.
+Filters a verb CSV by frequency, with optional row-level filtering.
 
-**Output:** CSV with fields and their frequency counts (sorted by frequency descending)
-
-**Usage:**
 ```bash
-python SpaCyVerbCounter.py input.csv output.csv --field lemma
-python SpaCyVerbCounter.py input.csv output.csv --field surface_lower
+python FilterSpaCyVerbs.py verbs.csv verbs_min20.csv --field lemma --min-freq 20
+python FilterSpaCyVerbs.py verbs.csv verbs_mid.csv --field surface_lower --min-freq 10 --max-freq 5000
+python FilterSpaCyVerbs.py verbs.csv verbs_top.csv --field lemma --min-freq 80%
+python FilterSpaCyVerbs.py --load-metadata verbs_min20.json verbs_min20.csv rerun.csv --strict-checksum
 ```
 
----
+Current options:
 
-### Phase 2: Filtering & Sampling
+- Required in CLI mode: `input_csv`, `output_csv`
+- Frequency field: `--field lemma|surface_lower`
+- Frequency bounds: `--min-freq`, `--max-freq`
+- Percentile mode: append `%`, for example `--min-freq 80%`
+- Row filter: `--where "{{source}} == 'NCTE'"`
+- Reproducibility: `--load-metadata`, `--strict-checksum`
 
-#### [filterSpaCyVerbs.py](filterSpaCyVerbs.py)
-Filters verbs by frequency in a two-pass streaming process.
+### `randomSampleCSV.py`
 
-**Features:**
-- Memory-efficient: counts unique values but streams rows
-- Filters on `lemma` or `surface_lower` with min/max frequency bounds
-- Useful for removing rare or overly common verbs
+Samples rows from a CSV.
 
-**Usage:**
 ```bash
-python filterSpaCyVerbs.py input.csv output.csv --field lemma --min-freq 10 --max-freq 5000
+python randomSampleCSV.py verbs.csv verbs_sample.csv 100000 --seed 42
 ```
 
----
+### `RoBERTaMaskedLanguageModelVerbs.py`
 
-#### [randomSampleCSV.py](randomSampleCSV.py)
-Randomly samples n rows from a large CSV file without loading entire file into memory.
+Runs masked-language-model inference over each verb row.
 
-**Features:**
-- Two-pass approach: count rows, then select n distinct indices
-- Optional seed for reproducibility
+GUI:
 
-**Usage:**
 ```bash
-python randomSampleCSV.py input.csv output.csv 100000 --seed 42
+python RoBERTaMaskedLanguageModelVerbs.py
 ```
 
----
+CLI:
 
-### Phase 3: RoBERTa MLM Inference
-
-#### [roberta_mlm_on_verbs.py](roberta_mlm_on_verbs.py)
-Runs RoBERTa masked-language-model inference on each verb in context.
-
-**Core Workflow:**
-1. For each row: replace verb span with `<mask>` token
-2. Run MLM inference via RoBERTa
-3. Collect top-k predictions with probabilities
-4. (Optional) Sum probabilities for each semantic group
-
-**Output Columns:**
-- Original columns from input CSV
-- `token_1`, `prob_1`, `token_2`, `prob_2`, ..., `token_k`, `prob_k`
-- (If using groups) `group_1`, `group_2`, ... (aggregated probabilities)
-
-**Usage:**
 ```bash
-python roberta_mlm_on_verbs.py verbs.csv verbs_with_mlm.csv --model roberta-base --batch-size 16 --top-k 10
-python roberta_mlm_on_verbs.py verbs.csv verbs_with_mlm.csv --group-csv verb_groups.csv --batch-size 32
-python roberta_mlm_on_verbs.py verbs.csv out.csv --log-level DEBUG --debug-limit 100
+python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --model roberta-base --batch-size 8 --top-k 10
+python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --device mps --log-every 5000
+python RoBERTaMaskedLanguageModelVerbs.py --load-metadata verbs_min20.json verbs_min20.csv verbs_mlm.csv
+python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv debug_mlm.csv --debug-limit 100 --log-level DEBUG
 ```
 
-**Requirements:**
+Current options:
+
+- Required in CLI mode: `input_csv`, `output_csv`
+- Model/runtime: `--model`, `--batch-size`, `--top-k`, `--device`
+- Logging/debugging: `--log-every`, `--log-level`, `--debug-limit`
+- CSV/reproducibility: `--encoding`, `--load-metadata`
+
+Input CSVs must contain either `context` + `span_in_context` or `sentence` + `span_in_sentence_char`. Output appends `token_1`, `prob_1`, ..., `token_k`, `prob_k`.
+
+Memory note: if macOS reports application memory pressure, lower `--batch-size`. The script retries smaller batches on memory failures and clears CUDA/MPS caches between batches, but RoBERTa still produces large logits internally.
+
+### `MLMGroupAggregator.py`
+
+Maps MLM token predictions to semantic group probabilities without rerunning RoBERTa.
+
+GUI:
+
 ```bash
-pip install transformers torch lemminflect
+python MLMGroupAggregator.py
 ```
 
-**Features:**
-- Streaming-friendly: reads & writes line-by-line
-- Supports batch inference for efficiency
-- Lemmatizes predictions using lemminflect (VERB-preferred)
-- Groups predictions by semantic category if group CSV provided
+CLI:
 
----
-
-### Phase 4: Group Management & Remapping
-
-#### [mlm_to_groups.py](mlm_to_groups.py)
-Recomputes group probabilities using a NEW grouping definition without re-running the model.
-
-**Use Case:**
-- You have MLM output with top-k predictions
-- You now have a new/different group CSV
-- Recompute group-aggregated probabilities from existing predictions
-
-**Group CSV Format:**
-```
-group1,group2,group3
-lemma1,lemma2,
-lemma3,,lemma4
-```
-(Columns = group names; cells = lemmas in that group)
-
-**Output Modes:**
-1. **Default:** All original columns + new group columns
-2. **`--short`:** Only lemma + group columns
-
-**Usage:**
 ```bash
-python mlm_to_groups.py mlm_out.csv new_groups.csv mlm_out_regrouped.csv
-python mlm_to_groups.py mlm_out.csv new_groups.csv regrouped_short.csv --short --include-count
+python MLMGroupAggregator.py verbs_mlm.csv groups.csv verbs_mlm_groups.csv
+python MLMGroupAggregator.py verbs_mlm.csv groups.csv groups_short.csv --short --include-count
+python MLMGroupAggregator.py verbs_mlm.csv groups.csv verbs_mlm_groups.csv --workers 4 --chunk-size 2000
+python MLMGroupAggregator.py verbs_mlm.csv groups.csv verbs_mlm_groups.csv --load-metadata verbs_mlm.json
 ```
 
-**Requirements:**
+Current options:
+
+- Required in CLI mode: `mlm_csv`, `group_csv`, `output_csv`
+- Prediction parsing: `--top-k`, `--lemma-col`
+- Output shape: `--short`, `--include-count`
+- Runtime/logging: `--workers`, `--chunk-size`, `--log-every`, `--log-level`
+- CSV/reproducibility: `--encoding`, `--load-metadata`
+
+Group CSV format uses group names as headers and lemmas underneath each group:
+
+```csv
+thinking,motion,communication
+think,run,say
+believe,jump,tell
+```
+
+### `LemmaToGroupProbs.py`
+
+Aggregates row-level group probabilities by lemma. Outputs `.csv`, `.tsv`, `.xlsx`, or `.xlsm`.
+
 ```bash
-pip install lemminflect
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.csv
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.xlsx
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.xlsx --second-threshold 0.40
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.xlsx --auto-groups --importance-cutoff 0.05
+python LemmaToGroupProbs.py verbs_mlm_groups.csv lemma_group_probs.csv --group-cols thinking motion communication
 ```
 
----
+Current options:
 
-#### [tagged_verbs_to_groups.py](tagged_verbs_to_groups.py)
-Transposes manual verb-to-group annotations into a group-by-lemma matrix.
+- Required in CLI mode: `input_csv`, `output`
+- Column selection: `--lemma-col`, `--group-cols`
+- Excel highlighting/analysis: `--second-threshold`, `--auto-groups`, `--importance-cutoff`, `--include-ambiguous-auto-groups`, `--overlap-measure`, `--vba-links`
+- CSV/reproducibility: `--encoding`, `--load-metadata`
 
-**Input CSV Format:**
-```
-lemma,frequency,group1,group2,group3
-think,100,1,,
-run,50,,1,
-jump,30,,,1
-```
-(At most one '1' per row; blanks/0s elsewhere)
+### `MLMLemmaExtractor.py`
 
-**Output CSV Format:**
-```
-group1,group2,group3
-think,,
-,run,
-,,jump
-```
-(One row per lemma, ragged columns padded with blanks)
+Prints sentences for one or more lemmas from an MLM output CSV.
 
-**Usage:**
 ```bash
-python tagged_verbs_to_groups.py tagged_input.csv group_output.csv
-python tagged_verbs_to_groups.py tagged_input.csv group_output.csv --ignore think,run
+python MLMLemmaExtractor.py think verbs_mlm.csv
+python MLMLemmaExtractor.py think,believe verbs_mlm.csv --limit 25
+python MLMLemmaExtractor.py run verbs_mlm.csv --show-topk --top-k 5
 ```
 
----
+Current options:
 
-### Phase 5: Statistical Aggregation
+- Required: `lemmas`, `mlm_csv`
+- Columns: `--lemma-col`, `--sentence-col`
+- Display: `--limit`, `--show-topk`, `--top-k`
+- CSV: `--encoding`
 
-#### [LemmaToGroupProbs.py](LemmaToGroupProbs.py)
-Aggregates group probabilities by lemma, producing summary statistics.
+### `tagged_verbs_to_groups.py`
 
-**Input:** MLM output CSV with group probability columns
+Converts a manually tagged lemma table into the group CSV format used by `MLMGroupAggregator.py`.
 
-**Output Formats:**
-
-**CSV Mode:**
-```
-lemma,group1(%),group2(%),group3(%),count
-think,45.2,32.1,22.7,125
-run,18.9,61.3,19.8,98
-```
-
-**Excel Mode** (`.xlsx`):
-1. **Sheet 1 (lemma_to_groups):**
-   - Mean group probabilities (formatted as %)
-   - Highest percentage bolded per row
-   - Lemma cell **BLUE** if runner-up group ≥ 50% of leader
-
-2. **Sheet 2 (groups_ranked):**
-   - For each group: lemmas ranked by descending probability
-   - Lemma bolded where it achieves group maximum
-
-**Features:**
-- Auto-detects group columns (all after last `prob_k` column)
-- Customizable group column specification
-- Runner-up detection for ambiguous lemmas
-
-**Usage:**
 ```bash
-python LemmaToGroupProbs.py mlm_out.csv output.csv
-python LemmaToGroupProbs.py mlm_out.csv output.xlsx  # Excel output
-python LemmaToGroupProbs.py mlm_out.csv output.xlsx --second-threshold 0.40
-python LemmaToGroupProbs.py mlm_out.csv output.csv --group-cols group1,group2,group3
+python tagged_verbs_to_groups.py tagged_verbs.csv groups.csv
+python tagged_verbs_to_groups.py tagged_verbs.csv groups.csv --ignore uncertain misc
 ```
 
-**Requirements for Excel:**
+Input format:
+
+```csv
+lemma,frequency,thinking,motion
+think,100,1,
+run,50,,1
+```
+
+### `TextVerbGroupCounter.py`
+
+Counts verb groups directly from a CSV text column.
+
 ```bash
-pip install openpyxl
+python TextVerbGroupCounter.py documents.csv groups.csv document_group_counts.xlsx --text-col text
+python TextVerbGroupCounter.py documents.csv groups.csv document_group_counts.csv --model en_core_web_sm --include-aux
+python TextVerbGroupCounter.py documents.csv groups.csv counts.xlsx --where "{{grade}} == '8'"
 ```
 
----
+Current options:
 
-#### [mlm_lem.py](mlm_lem.py)
-Retrieves and displays sentences for a specific lemma from MLM output.
+- Required: `input_csv`, `group_csv`, `output`
+- Input/NLP: `--text-col`, `--encoding`, `--model`, `--include-aux`, `--batch-size`
+- Filtering/runtime: `--where`, `--force-cpu`
+- Reproducibility: `--load-metadata`
 
-**Features:**
-- Filters rows by target lemma
-- Optionally displays top-k predictions stored in MLM output
-- Configurable output limit
+### `SpellChecker.py`
 
-**Usage:**
+Spell-checks text or CSV input and writes corrected output plus metadata.
+
 ```bash
-python mlm_lem.py run mlm_out.csv
-python mlm_lem.py run mlm_out.csv --limit 10
-python mlm_lem.py run mlm_out.csv --show-topk --top-k 5
+python SpellChecker.py input.txt corrected.txt
+python SpellChecker.py rows.csv corrected.csv --text-column text --csv-format complete
+python SpellChecker.py input.txt corrected.patch --text-format patch
 ```
 
----
+Current options:
 
-### Utility: Pattern Analysis
+- Required in CLI mode: `input_file`, `output_file`
+- Mode/dictionaries: `--mode`, `--language`, `--custom-dict`, `--ignore-list`
+- CSV/text handling: `--text-column`, `--csv-format`, `--text-format`, `--encoding`
+- Reproducibility: `--load-metadata`, `--strict-checksum`
 
-#### [count_patterns.py](count_patterns.py)
-Analyzes local context patterns for a specific verb lemma.
+## Utility Scripts
 
-**Workflow:**
-1. Load verb inflections for target lemma (e.g., "think")
-2. Search MLM output for sentences containing any inflection
-3. Extract local context windows (n-grams around verb)
-4. Count and rank patterns by frequency
+- `UnifiedVerbToolsApp.py`: GUI launcher for multiple tools.
+- `run_with_mps.py`: helper for running with Apple Metal/MPS settings.
+- `merge_csv_by_row_number.py`: joins CSVs by row number.
+- `FilteredVerbInflectionExtractor.py`: extracts inflection lists from filtered verb data.
+- `count_patterns.py`: local pattern-counting utility for targeted analysis.
+- `view_log.py`: log viewer utility.
 
-**Usage:**
-```python
-# Edit script to set target verb, then run:
-python count_patterns.py
-```
+Experimental or legacy files are present in the repository, including `SpaCyVerbExtractor2.py`, `MLMGroupProbabilityAggregator.py`, and several one-off scripts with descriptive filenames. Prefer the scripts listed above for current pipeline work.
 
----
+## Metadata And Checksums
 
-## Data Files
+Supported scripts write a JSON sidecar with the same base name as the output file, for example `verbs_mlm.csv` -> `verbs_mlm.json`.
 
-### Input Data
-- `verbs.csv` – Raw extracted verbs (lemma, surface_lower, sentence, span)
-- `verb_groups.csv` – Manual verb-to-group mapping (columns = groups)
-- `filepaths.txt` – Newline-separated paths to raw text files (for SpaCyVerbExtractor)
+Checksum behavior:
 
-### Intermediate/Output Data
-- `verbs_sample.csv` – Random sample of extracted verbs
-- `verbs_min10.csv` – Verbs filtered to frequency ≥ 10
-- `verbs_with_mlm.csv` – MLM predictions + probabilities
-- `verbs_with_mlm_2.csv` – Re-grouped version or variant
-- `lem_gp_prob.csv` – Aggregated lemma → group probabilities (CSV)
-- `lem_gp_prob.xlsx` – Aggregated lemma → group probabilities (Excel, multi-sheet)
-- `groups.csv`, `groups_2.csv` – Different semantic verb groupings
-- `verb_counts.csv` – Frequency counts for all verbs
-- `lemma_counts.csv` – Frequency counts by lemma
-- `moved_think.csv` – Analysis output for specific verb
+- Extraction metadata stores input file checksums and output checksum.
+- Filter metadata stores both input and output checksums.
+- MLM metadata verifies upstream filter/extractor output checksums when chaining from metadata.
+- Aggregator metadata stores checksums for the MLM CSV, group CSV, and output.
 
----
-
-## Typical Workflow
-
-```
-Raw Text Files (filepaths.txt)
-         ↓
-    [SpaCyVerbExtractor] → verbs.csv
-         ↓
-   [filterSpaCyVerbs or randomSampleCSV]
-         ↓
-    verbs_filtered.csv
-         ↓
-  [roberta_mlm_on_verbs]
-         ↓
-    verbs_with_mlm.csv  (token predictions + optional group probs)
-         ↓
-     [LemmaToGroupProbs]
-         ↓
-    lem_gp_prob.csv / .xlsx  (aggregated statistics)
-         
-Alternative/Parallel:
-    [tagged_verbs_to_groups] → Convert manual tags to group matrix
-         ↓
-    [mlm_to_groups] → Recompute probabilities with new grouping
-```
-
----
-
-## Dependencies
-
-**Core:**
-```bash
-pip install spacy transformers torch lemminflect
-```
-
-**Model:**
-```bash
-python -m spacy download en_core_web_sm
-# RoBERTa model downloaded automatically via transformers
-```
-
-**Optional (Excel support):**
-```bash
-pip install openpyxl
-```
-
----
-
-## Notes
-
-- All scripts stream CSV data when possible to minimize memory usage
-- Lemmatization uses `lemminflect` with VERB part-of-speech preference
-- Group files are expected to be ragged CSVs (variable column lengths per row)
-- Character spans are zero-indexed, end-exclusive (`start:end` format)
-- RoBERTa predictions are normalized and lemmatized for group matching
-
----
+Use `--load-metadata` to reload settings from a previous run. CLI arguments supplied at the same time override loaded settings where supported.
 
 ## Testing
 
-- Minimal harness:
-     - `tests/run_tests.py` bootstraps a local virtualenv, installs `openpyxl` and `lemminflect`, generates sample CSVs, and validates both CSV and XLSX outputs including the "Groups" sheet.
-     - Run:
-          ```bash
-          python3 tests/run_tests.py
-          ```
+Run syntax checks for edited scripts:
 
-- Pytest suite:
-     - `tests/test_mlm_group_aggregator.py` contains two tests (CSV and XLSX). Each test creates an isolated venv for dependencies and runs `MLMGroupAggregator.py` end-to-end.
-     - Quick-start with a local venv:
-          ```bash
-          python3 -m venv .venv_pytest
-          ./.venv_pytest/bin/python -m pip install --upgrade pip
-          ./.venv_pytest/bin/python -m pip install pytest
-          ./.venv_pytest/bin/python -m pytest -q
-          ```
+```bash
+python3 -m py_compile SpaCyVerbExtractor.py FilterSpaCyVerbs.py RoBERTaMaskedLanguageModelVerbs.py MLMGroupAggregator.py LemmaToGroupProbs.py
+```
+
+Run the test suite:
+
+```bash
+uv run pytest -q
+```
+
+Some tests or direct script runs require project dependencies such as `spacy`, `torch`, `lemminflect`, `openpyxl`, and `PySide6`.
