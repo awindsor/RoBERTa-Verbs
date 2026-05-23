@@ -36,18 +36,36 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import time
-from datetime import datetime
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
+from functools import lru_cache
+from itertools import islice
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Set, Tuple, Optional, Sequence
 
 from lemminflect import getLemma
 import hashlib
 
 
 PROB_COL_RE = re.compile(r"^prob_(\d+)$")
+
+_WORKER_GROUP_LABELS: List[str] = []
+_WORKER_LEMMA_TO_GROUPS: Dict[str, Set[str]] = {}
+_WORKER_K = 0
+_WORKER_LEMMA_COL = "lemma"
+_WORKER_SHORT = False
+_WORKER_GROUP_COLNAME_MAP: Dict[str, str] = {}
+
+
+def default_worker_count(reserve_cores: int = 2) -> int:
+    """Return a responsive default worker count, leaving some cores free."""
+    cpu_total = os.cpu_count() or 1
+    return max(1, cpu_total - reserve_cores)
 
 
 # ============================================================================
@@ -84,10 +102,12 @@ def save_aggregation_metadata(
     group_checksum: str,
     output_checksum: str,
     settings: Dict[str, Any],
-    stats: Dict[str, Any],
+    stats: Optional[Dict[str, Any]],
     group_labels: List[str],
     lemma_to_groups: Dict[str, Set[str]],
     source_metadata: Optional[Dict] = None,
+    command: Optional[str] = None,
+    status: str = "completed",
 ) -> None:
     """Save aggregation metadata to JSON file alongside output.
     
@@ -107,9 +127,10 @@ def save_aggregation_metadata(
         groups_structure[group_name] = lemmas_in_group
     
     metadata = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": "MLMGroupAggregator",
         "versions": get_aggregator_version_info(),
+        "status": status,
         "output_file": str(output_path),
         "output_checksum": output_checksum,
         "input_files": {
@@ -120,6 +141,7 @@ def save_aggregation_metadata(
             "mlm_csv": mlm_checksum,
             "group_csv": group_checksum,
         },
+        "command": command,
         "groups": groups_structure,
         "settings": {
             "top_k": settings.get("top_k"),
@@ -127,6 +149,8 @@ def save_aggregation_metadata(
             "short": settings.get("short", False),
             "include_count": settings.get("include_count", False),
             "encoding": settings.get("encoding", "utf-8-sig"),
+            "workers": settings.get("workers"),
+            "chunk_size": settings.get("chunk_size"),
         },
         "statistics": stats,
     }
@@ -137,6 +161,34 @@ def save_aggregation_metadata(
     
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+
+
+def save_incomplete_aggregation_metadata(
+    output_path: Path,
+    mlm_csv_path: Path,
+    group_csv_path: Path,
+    settings: Dict[str, Any],
+    group_labels: List[str],
+    lemma_to_groups: Dict[str, Set[str]],
+    source_metadata: Optional[Dict] = None,
+    command: Optional[str] = None,
+) -> None:
+    """Write restartable metadata before aggregation begins."""
+    save_aggregation_metadata(
+        output_path=output_path,
+        mlm_csv_path=mlm_csv_path,
+        group_csv_path=group_csv_path,
+        mlm_checksum="",
+        group_checksum="",
+        output_checksum="",
+        settings=settings,
+        stats=None,
+        group_labels=group_labels,
+        lemma_to_groups=lemma_to_groups,
+        source_metadata=source_metadata,
+        command=command,
+        status="incomplete",
+    )
 
 
 def load_aggregation_metadata(json_path: Path) -> Any:
@@ -221,6 +273,7 @@ def _write_groups_sheet_openpyxl(wb, group_labels: List[str], lemma_to_groups: D
 # ============================================================================
 
 
+@lru_cache(maxsize=200_000)
 def normalize_pred_token(tok: str) -> str:
     """Normalize an MLM prediction token to a lemma key used by groups.
 
@@ -250,7 +303,155 @@ def normalize_pred_token(tok: str) -> str:
     return s
 
 
-def load_groups_csv(group_csv_path: str, encoding: str, logger: logging.Logger) -> Tuple[List[str], Dict[str, Set[str]]]:
+def _init_aggregation_worker(
+    group_labels: List[str],
+    lemma_to_groups: Dict[str, Set[str]],
+    k: int,
+    lemma_col: str,
+    short: bool,
+    group_colname_map: Dict[str, str],
+) -> None:
+    """Initialize per-process state for batch aggregation workers."""
+    global _WORKER_GROUP_LABELS, _WORKER_LEMMA_TO_GROUPS, _WORKER_K
+    global _WORKER_LEMMA_COL, _WORKER_SHORT, _WORKER_GROUP_COLNAME_MAP
+    _WORKER_GROUP_LABELS = group_labels
+    _WORKER_LEMMA_TO_GROUPS = lemma_to_groups
+    _WORKER_K = k
+    _WORKER_LEMMA_COL = lemma_col
+    _WORKER_SHORT = short
+    _WORKER_GROUP_COLNAME_MAP = group_colname_map
+
+
+def _process_aggregation_batch(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Aggregate one batch of MLM rows. Output order matches input order."""
+    results: List[Dict[str, Any]] = []
+    group_labels = _WORKER_GROUP_LABELS
+    lemma_to_groups = _WORKER_LEMMA_TO_GROUPS
+    k = _WORKER_K
+    lemma_col = _WORKER_LEMMA_COL
+    short = _WORKER_SHORT
+    group_colname_map = _WORKER_GROUP_COLNAME_MAP
+
+    for row in rows:
+        try:
+            lemma = (row.get(lemma_col) or "").strip()
+            if not lemma:
+                raise ValueError(f"Empty lemma in column {lemma_col!r}")
+
+            group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
+
+            for i in range(1, k + 1):
+                tok = row.get(f"token_{i}", "")
+                p_str = row.get(f"prob_{i}", "")
+                if not tok or not p_str:
+                    continue
+                try:
+                    prob = float(p_str)
+                except ValueError:
+                    continue
+
+                key = normalize_pred_token(tok)
+                gs = lemma_to_groups.get(key)
+                if not gs:
+                    continue
+                for g in gs:
+                    group_sums[g] += prob
+
+            if short:
+                out_row = {lemma_col: lemma}
+                for g in group_labels:
+                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+            else:
+                out_row = dict(row)
+                for g in group_labels:
+                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
+
+            results.append({"ok": True, "lemma": lemma, "out_row": out_row})
+        except Exception as e:
+            results.append({"ok": False, "error": str(e)})
+
+    return results
+
+
+def _iter_row_batches(reader: csv.DictReader, chunk_size: int) -> Iterable[List[Dict[str, str]]]:
+    """Yield fixed-size batches of rows from a DictReader."""
+    while True:
+        batch = list(islice(reader, chunk_size))
+        if not batch:
+            return
+        yield batch
+
+
+def _iter_row_batches_with_offsets(
+    reader: csv.DictReader,
+    file_obj,
+    chunk_size: int,
+) -> Iterable[Tuple[List[Dict[str, str]], int]]:
+    """Yield fixed-size batches of rows plus the current input file byte offset."""
+    while True:
+        batch = list(islice(reader, chunk_size))
+        if not batch:
+            return
+        yield batch, file_obj.buffer.tell()
+
+
+def _terminate_process_pool(executor: ProcessPoolExecutor, progress_callback=None) -> None:
+    """Aggressively stop a process pool, including currently running workers."""
+    if progress_callback:
+        progress_callback("Terminating worker processes...")
+    executor.shutdown(wait=False, cancel_futures=True)
+    processes = getattr(executor, "_processes", {}) or {}
+    for proc in processes.values():
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+    for proc in processes.values():
+        try:
+            proc.join(timeout=0.2)
+            if proc.is_alive() and hasattr(proc, "kill"):
+                proc.kill()
+        except Exception:
+            pass
+
+
+def _get_future_result_with_cancellation(
+    future,
+    executor: ProcessPoolExecutor,
+    is_cancelled,
+    progress_callback=None,
+):
+    """Poll a future so cancellation can tear down running workers promptly."""
+    while True:
+        if is_cancelled():
+            if progress_callback:
+                progress_callback("Cancellation requested. Stopping running batches...")
+            _terminate_process_pool(executor, progress_callback)
+            raise KeyboardInterrupt("User cancelled")
+        try:
+            return future.result(timeout=0.2)
+        except FuturesTimeoutError:
+            continue
+
+
+def _format_bytes(num_bytes: int) -> str:
+    """Render a byte count with binary units for the progress label."""
+    value = float(max(0, num_bytes))
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+
+
+def load_groups_csv(
+    group_csv_path: str,
+    encoding: str,
+    logger: logging.Logger,
+    progress_callback=None,
+) -> Tuple[List[str], Dict[str, Set[str]]]:
     """Load groups from a wide CSV (columns=groups, rows=list lemmas) into mapping.
 
     Returns:
@@ -259,13 +460,20 @@ def load_groups_csv(group_csv_path: str, encoding: str, logger: logging.Logger) 
     p = Path(group_csv_path)
     if not p.exists():
         raise FileNotFoundError(f"Group CSV not found: {p}")
+    logger.info(f"Opening group CSV: {p}")
+    if progress_callback:
+        progress_callback(f"Opening group CSV: {p}")
     with p.open("r", newline="", encoding=encoding) as f:
         reader = csv.reader(f)
         header = next(reader, None)
         if not header:
             raise ValueError("Group CSV is empty or missing header row")
         group_labels: List[str] = [h.strip() for h in header if h and h.strip()]
+        logger.info(f"Found {len(group_labels)} groups in group CSV header")
+        if progress_callback:
+            progress_callback(f"Found {len(group_labels)} groups in group CSV header")
         lemma_to_groups: Dict[str, Set[str]] = {}
+        inflection_logged = False
         for row in reader:
             for idx, g in enumerate(group_labels):
                 if idx >= len(row):
@@ -273,6 +481,11 @@ def load_groups_csv(group_csv_path: str, encoding: str, logger: logging.Logger) 
                 cell = (row[idx] or "").strip()
                 if not cell:
                     continue
+                if not inflection_logged:
+                    logger.info("Inflecting group lemmas with lemminflect during group normalization...")
+                    if progress_callback:
+                        progress_callback("Inflecting group lemmas with lemminflect during group normalization...")
+                    inflection_logged = True
                 key = normalize_pred_token(cell)
                 if not key:
                     continue
@@ -339,6 +552,18 @@ def run_cli() -> None:
     ap.add_argument("--log-every", type=int, default=100000, help="Log progress every N rows")
     ap.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of worker processes to use (default: CPU cores minus 2; use 1 to disable)",
+    )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Rows per worker batch (default: 2000)",
+    )
+    ap.add_argument(
         "--load-metadata",
         help="Load settings from metadata JSON (RoBERTaMaskedLanguageModelVerbs.json or MLMGroupAggregator.json)"
     )
@@ -396,6 +621,10 @@ def run_cli() -> None:
             args.short = settings.get("short", False)
         if not args.include_count:
             args.include_count = settings.get("include_count", False)
+        if args.workers is None:
+            args.workers = settings.get("workers")
+        if args.chunk_size is None:
+            args.chunk_size = settings.get("chunk_size")
         
         # Infer input file paths based on tool type
         if tool_name == "RoBERTaMaskedLanguageModelVerbs":
@@ -416,6 +645,14 @@ def run_cli() -> None:
         raise SystemExit(f"MLM CSV not found: {mlm_path}")
     if not group_path.exists():
         raise SystemExit(f"Group CSV not found: {group_path}")
+    if args.workers is None:
+        args.workers = default_worker_count()
+    if args.chunk_size is None:
+        args.chunk_size = 2000
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    if args.chunk_size < 1:
+        raise SystemExit("--chunk-size must be >= 1")
     
     # Verify checksums if metadata was loaded
     if metadata:
@@ -425,6 +662,16 @@ def run_cli() -> None:
     
     start_time = time.time()
     group_labels, lemma_to_groups = load_groups_csv(args.group_csv, "utf-8-sig", logger)
+    aggregation_settings = {
+        "top_k": args.top_k if args.top_k > 0 else None,
+        "lemma_col": args.lemma_col,
+        "short": args.short,
+        "include_count": args.include_count,
+        "encoding": args.encoding,
+        "workers": args.workers,
+        "chunk_size": args.chunk_size,
+        "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
+    }
     
     processed = 0
     skipped = 0
@@ -444,6 +691,7 @@ def run_cli() -> None:
             k = args.top_k if args.top_k > 0 else infer_top_k(fieldnames)
             if k <= 0:
                 raise SystemExit("Could not infer top_k from header; provide --top-k explicitly.")
+            aggregation_settings["top_k"] = k
 
             # Verify required token/prob columns
             missing_cols = []
@@ -460,6 +708,16 @@ def run_cli() -> None:
 
             # Build output columns
             group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
+            worker_count = args.workers
+            use_parallel = worker_count > 1
+            if use_parallel:
+                logger.info(
+                    "Using %d worker processes with chunk size %d",
+                    worker_count,
+                    args.chunk_size,
+                )
+            else:
+                logger.info("Using single-process aggregation")
 
             if args.short:
                 out_fieldnames = [args.lemma_col] + group_out_cols
@@ -469,6 +727,18 @@ def run_cli() -> None:
                 out_fieldnames = list(fieldnames) + group_out_cols
 
             is_xlsx = output_path.suffix.lower() == ".xlsx"
+
+            save_incomplete_aggregation_metadata(
+                output_path=output_path,
+                mlm_csv_path=mlm_path,
+                group_csv_path=group_path,
+                settings=aggregation_settings,
+                group_labels=group_labels,
+                lemma_to_groups=lemma_to_groups,
+                source_metadata=source_metadata,
+                command=" ".join(sys.argv),
+            )
+            logger.info(f"✓ Saved incomplete metadata to {output_path.with_suffix('.json')}")
 
             if is_xlsx:
                 try:
@@ -490,54 +760,48 @@ def run_cli() -> None:
                 ws = wb.create_sheet("Aggregated")
                 ws.append([_clean_cell(c) for c in out_fieldnames])
 
-                for row in reader:
-                    try:
-                        lemma = (row.get(args.lemma_col) or "").strip()
-                        if not lemma:
-                            raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
-
-                        group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
-
-                        for i in range(1, k + 1):
-                            tok = row.get(f"token_{i}", "")
-                            p_str = row.get(f"prob_{i}", "")
-                            if not tok or not p_str:
-                                continue
-                            try:
-                                prob = float(p_str)
-                            except ValueError:
-                                continue
-
-                            key = normalize_pred_token(tok)
-                            gs = lemma_to_groups.get(key)
-                            if not gs:
-                                continue
-                            for g in gs:
-                                group_sums[g] += prob
-
-                        if args.short:
-                            out_row = {args.lemma_col: lemma}
-                            for g in group_labels:
-                                out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                            if args.include_count:
-                                lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                                out_row["lemma_count"] = str(lemma_counts[lemma])
-                        else:
-                            out_row = dict(row)
-                            for g in group_labels:
-                                out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-
-                        ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
-                        processed += 1
-
-                    except Exception as e:
-                        skipped += 1
-                        if skipped <= 10:
-                            logger.warning(f"Skipping row due to error: {e}")
-                        continue
-
-                    if args.log_every > 0 and processed % args.log_every == 0:
-                        logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+                row_batches = _iter_row_batches(reader, args.chunk_size)
+                if use_parallel:
+                    with ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        initializer=_init_aggregation_worker,
+                        initargs=(group_labels, lemma_to_groups, k, args.lemma_col, args.short, group_colname_map),
+                    ) as executor:
+                        result_batches = executor.map(_process_aggregation_batch, row_batches)
+                        for batch_results in result_batches:
+                            for result in batch_results:
+                                if result["ok"]:
+                                    out_row = result["out_row"]
+                                    if args.short and args.include_count:
+                                        lemma = result["lemma"]
+                                        lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                        out_row["lemma_count"] = str(lemma_counts[lemma])
+                                    ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
+                                    processed += 1
+                                else:
+                                    skipped += 1
+                                    if skipped <= 10:
+                                        logger.warning(f"Skipping row due to error: {result['error']}")
+                            if args.log_every > 0 and processed and processed % args.log_every < len(batch_results):
+                                logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+                else:
+                    _init_aggregation_worker(group_labels, lemma_to_groups, k, args.lemma_col, args.short, group_colname_map)
+                    for batch in row_batches:
+                        for result in _process_aggregation_batch(batch):
+                            if result["ok"]:
+                                out_row = result["out_row"]
+                                if args.short and args.include_count:
+                                    lemma = result["lemma"]
+                                    lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                    out_row["lemma_count"] = str(lemma_counts[lemma])
+                                ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
+                                processed += 1
+                            else:
+                                skipped += 1
+                                if skipped <= 10:
+                                    logger.warning(f"Skipping row due to error: {result['error']}")
+                        if args.log_every > 0 and processed and processed % args.log_every < len(batch):
+                            logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
 
                 # Add groups sheet and save workbook
                 _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
@@ -547,55 +811,48 @@ def run_cli() -> None:
                 with output_path.open("w", newline="", encoding=args.encoding) as fout:
                     writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
                     writer.writeheader()
-
-                    for row in reader:
-                        try:
-                            lemma = (row.get(args.lemma_col) or "").strip()
-                            if not lemma:
-                                raise ValueError(f"Empty lemma in column {args.lemma_col!r}")
-
-                            group_sums = {g: 0.0 for g in group_labels}
-
-                            for i in range(1, k + 1):
-                                tok = row.get(f"token_{i}", "")
-                                p_str = row.get(f"prob_{i}", "")
-                                if not tok or not p_str:
-                                    continue
-                                try:
-                                    prob = float(p_str)
-                                except ValueError:
-                                    continue
-
-                                key = normalize_pred_token(tok)
-                                gs = lemma_to_groups.get(key)
-                                if not gs:
-                                    continue
-                                for g in gs:
-                                    group_sums[g] += prob
-
-                            if args.short:
-                                out_row = {args.lemma_col: lemma}
-                                for g in group_labels:
-                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                                if args.include_count:
-                                    lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                                    out_row["lemma_count"] = str(lemma_counts[lemma])
-                            else:
-                                out_row = dict(row)
-                                for g in group_labels:
-                                    out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-
-                            writer.writerow(out_row)
-                            processed += 1
-
-                        except Exception as e:
-                            skipped += 1
-                            if skipped <= 10:
-                                logger.warning(f"Skipping row due to error: {e}")
-                            continue
-
-                        if args.log_every > 0 and processed % args.log_every == 0:
-                            logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+                    row_batches = _iter_row_batches(reader, args.chunk_size)
+                    if use_parallel:
+                        with ProcessPoolExecutor(
+                            max_workers=worker_count,
+                            initializer=_init_aggregation_worker,
+                            initargs=(group_labels, lemma_to_groups, k, args.lemma_col, args.short, group_colname_map),
+                        ) as executor:
+                            result_batches = executor.map(_process_aggregation_batch, row_batches)
+                            for batch_results in result_batches:
+                                for result in batch_results:
+                                    if result["ok"]:
+                                        out_row = result["out_row"]
+                                        if args.short and args.include_count:
+                                            lemma = result["lemma"]
+                                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                            out_row["lemma_count"] = str(lemma_counts[lemma])
+                                        writer.writerow(out_row)
+                                        processed += 1
+                                    else:
+                                        skipped += 1
+                                        if skipped <= 10:
+                                            logger.warning(f"Skipping row due to error: {result['error']}")
+                                if args.log_every > 0 and processed and processed % args.log_every < len(batch_results):
+                                    logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
+                    else:
+                        _init_aggregation_worker(group_labels, lemma_to_groups, k, args.lemma_col, args.short, group_colname_map)
+                        for batch in row_batches:
+                            for result in _process_aggregation_batch(batch):
+                                if result["ok"]:
+                                    out_row = result["out_row"]
+                                    if args.short and args.include_count:
+                                        lemma = result["lemma"]
+                                        lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                        out_row["lemma_count"] = str(lemma_counts[lemma])
+                                    writer.writerow(out_row)
+                                    processed += 1
+                                else:
+                                    skipped += 1
+                                    if skipped <= 10:
+                                        logger.warning(f"Skipping row due to error: {result['error']}")
+                            if args.log_every > 0 and processed and processed % args.log_every < len(batch):
+                                logger.info(f"Written: {processed:,} | skipped: {skipped:,}")
         
         elapsed_time = time.time() - start_time
         
@@ -604,15 +861,6 @@ def run_cli() -> None:
         mlm_checksum = compute_file_md5(mlm_path)
         group_checksum = compute_file_md5(group_path)
         output_checksum = compute_file_md5(output_path)
-        
-        aggregation_settings = {
-            "top_k": k,
-            "lemma_col": args.lemma_col,
-            "short": args.short,
-            "include_count": args.include_count,
-            "encoding": args.encoding,
-            "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
-        }
         
         stats = {
             "rows_written": processed,
@@ -633,6 +881,7 @@ def run_cli() -> None:
             group_labels,
             lemma_to_groups,
             source_metadata,
+            " ".join(sys.argv),
         )
         
         logger.info(f"Done. Written={processed:,} skipped={skipped:,} output={args.output_csv}")
@@ -646,15 +895,6 @@ def run_cli() -> None:
         mlm_checksum = compute_file_md5(mlm_path)
         group_checksum = compute_file_md5(group_path)
         output_checksum = compute_file_md5(output_path) if output_path.exists() else ""
-        
-        aggregation_settings = {
-            "top_k": k,
-            "lemma_col": args.lemma_col,
-            "short": args.short,
-            "include_count": args.include_count,
-            "encoding": args.encoding,
-            "output_format": "xlsx" if output_path.suffix.lower() == ".xlsx" else "csv",
-        }
         
         stats = {
             "rows_written": processed,
@@ -676,6 +916,8 @@ def run_cli() -> None:
             group_labels,
             lemma_to_groups,
             source_metadata,
+            " ".join(sys.argv),
+            "stopped_by_user",
         )
         
         logger.info(f"Cancelled. Written={processed:,} skipped={skipped:,}")
@@ -731,6 +973,7 @@ def run_gui() -> None:
             short: bool,
             include_count: bool,
             encoding: str,
+            worker_count: int,
         ):
             super().__init__()
             self.mlm_csv_path = mlm_csv_path
@@ -741,6 +984,8 @@ def run_gui() -> None:
             self.short = short
             self.include_count = include_count
             self.encoding = encoding
+            self.worker_count = worker_count
+            self.chunk_size = 2000
             self._cancelled = False
         
         def cancel(self):
@@ -750,6 +995,7 @@ def run_gui() -> None:
         def run(self):
             """Run the aggregation in the worker thread."""
             try:
+                start_time = time.time()
                 self.progress_update.emit(f"Loading groups from: {self.group_csv_path}")
                 
                 # Create a dummy logger
@@ -761,25 +1007,20 @@ def run_gui() -> None:
                     str(self.group_csv_path),
                     "utf-8-sig",
                     logger,
+                    self.progress_update.emit,
                 )
                 
                 self.progress_update.emit(f"Reading: {self.mlm_csv_path}")
                 self.progress_update.emit("")
 
-                # Determine total rows for progress bar (header excluded)
-                # Use CSV reader to count actual CSV rows, not just lines
-                total_rows = 0
-                try:
-                    with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin_count:
-                        count_reader = csv.DictReader(fin_count)
-                        total_rows = sum(1 for _ in count_reader)
-                except Exception:
-                    total_rows = 0
+                total_bytes = self.mlm_csv_path.stat().st_size
+                self.progress_update.emit(f"MLM CSV size: {_format_bytes(total_bytes)}")
 
                 processed = 0
                 skipped = 0
                 lemma_counts: Dict[str, int] = {}
 
+                self.progress_update.emit("Opening MLM CSV and reading header...")
                 with self.mlm_csv_path.open(newline="", encoding=self.encoding) as fin:
                     reader = csv.DictReader(fin)
                     if reader.fieldnames is None:
@@ -789,11 +1030,27 @@ def run_gui() -> None:
                     if self.lemma_col not in fieldnames:
                         raise ValueError(f"Missing lemma column: {self.lemma_col}")
 
+                    self.progress_update.emit("Inferring top_k from MLM CSV header...")
                     k = self.top_k if self.top_k > 0 else infer_top_k(fieldnames)
                     if k <= 0:
                         raise ValueError("Could not infer top_k; specify --top-k")
+                    self.progress_update.emit(f"Using top_k={k}")
+                    aggregation_settings = {
+                        "top_k": k,
+                        "lemma_col": self.lemma_col,
+                        "short": self.short,
+                        "include_count": self.include_count,
+                        "encoding": self.encoding,
+                        "workers": self.worker_count,
+                        "chunk_size": self.chunk_size,
+                        "output_format": "xlsx" if self.output_csv_path.suffix.lower() == ".xlsx" else "csv",
+                    }
 
+                    self.progress_update.emit("Building output group columns...")
                     group_out_cols, group_colname_map = build_group_output_columns(fieldnames, group_labels)
+                    self.progress_update.emit(
+                        f"Using {self.worker_count} worker processes (chunk size {self.chunk_size})"
+                    )
 
                     if self.short:
                         out_fieldnames = [self.lemma_col] + group_out_cols
@@ -803,6 +1060,17 @@ def run_gui() -> None:
                         out_fieldnames = list(fieldnames) + group_out_cols
 
                     is_xlsx = self.output_csv_path.suffix.lower() == ".xlsx"
+                    save_incomplete_aggregation_metadata(
+                        output_path=self.output_csv_path,
+                        mlm_csv_path=self.mlm_csv_path,
+                        group_csv_path=self.group_csv_path,
+                        settings=aggregation_settings,
+                        group_labels=group_labels,
+                        lemma_to_groups=lemma_to_groups,
+                    )
+                    self.progress_update.emit(
+                        f"Saved metadata {self.output_csv_path.with_suffix('.json').name}"
+                    )
 
                     if is_xlsx:
                         try:
@@ -820,147 +1088,166 @@ def run_gui() -> None:
                             return val
 
                         # Write-only workbook keeps memory usage low for large files
+                        self.progress_update.emit("Initializing XLSX workbook...")
                         wb = Workbook(write_only=True)
                         ws = wb.create_sheet("Aggregated")
                         ws.append([_clean_cell(c) for c in out_fieldnames])
-
-                        for row in reader:
-                            try:
-                                lemma = (row.get(self.lemma_col) or "").strip()
-                                if not lemma:
-                                    raise ValueError("Empty lemma")
-
-                                group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
-
-                                for i in range(1, k + 1):
-                                    tok = row.get(f"token_{i}", "")
-                                    p_str = row.get(f"prob_{i}", "")
-                                    if not tok or not p_str:
-                                        continue
-                                    try:
-                                        prob = float(p_str)
-                                    except ValueError:
-                                        continue
-
-                                    key = normalize_pred_token(tok)
-                                    gs = lemma_to_groups.get(key)
-                                    if not gs:
-                                        continue
-                                    for g in gs:
-                                        group_sums[g] += prob
-
-                                if self.short:
-                                    out_row = {self.lemma_col: lemma}
-                                    for g in group_labels:
-                                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                                    if self.include_count:
-                                        lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                                        out_row["lemma_count"] = str(lemma_counts[lemma])
-                                else:
-                                    out_row = dict(row)
-                                    for g in group_labels:
-                                        out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-
-                                ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
-                                processed += 1
-                                if total_rows:
-                                    if processed % 1000 == 0 or processed == total_rows:
-                                        self.progress_value.emit(processed, total_rows)
-                                
-                                # Check for cancellation
+                        self.progress_update.emit("Preparing MLM row batches...")
+                        row_batches = _iter_row_batches_with_offsets(reader, fin, self.chunk_size)
+                        self.progress_update.emit("Resetting progress before batch loading...")
+                        self.progress_value.emit(0, total_bytes)
+                        self.progress_update.emit("Starting worker pool and queueing initial batches...")
+                        with ProcessPoolExecutor(
+                            max_workers=self.worker_count,
+                            initializer=_init_aggregation_worker,
+                            initargs=(group_labels, lemma_to_groups, k, self.lemma_col, self.short, group_colname_map),
+                        ) as executor:
+                            pending = deque()
+                            max_pending = max(1, self.worker_count * 2)
+                            for batch, bytes_read in row_batches:
+                                pending.append((executor.submit(_process_aggregation_batch, batch), bytes_read))
+                                if len(pending) < max_pending:
+                                    continue
+                                future, batch_bytes = pending.popleft()
+                                batch_results = _get_future_result_with_cancellation(
+                                    future,
+                                    executor,
+                                    lambda: self._cancelled,
+                                    self.progress_update.emit,
+                                )
+                                for result in batch_results:
+                                    if result["ok"]:
+                                        out_row = result["out_row"]
+                                        if self.short and self.include_count:
+                                            lemma = result["lemma"]
+                                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                            out_row["lemma_count"] = str(lemma_counts[lemma])
+                                        ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
+                                        processed += 1
+                                    else:
+                                        skipped += 1
+                                        if skipped <= 5:
+                                            self.progress_update.emit(f"⚠ Skipping row: {result['error'][:50]}")
+                                self.progress_value.emit(batch_bytes, total_bytes)
                                 if self._cancelled:
-                                    self.progress_update.emit("Cancellation requested...")
+                                    self.progress_update.emit("Cancellation requested. Stopping running batches...")
+                                    _terminate_process_pool(executor, self.progress_update.emit)
                                     raise KeyboardInterrupt("User cancelled")
-
-                            except Exception as e:
-                                skipped += 1
-                                if skipped <= 5:
-                                    self.progress_update.emit(f"⚠ Skipping row: {str(e)[:50]}")
-                                continue
+                            while pending:
+                                future, batch_bytes = pending.popleft()
+                                batch_results = _get_future_result_with_cancellation(
+                                    future,
+                                    executor,
+                                    lambda: self._cancelled,
+                                    self.progress_update.emit,
+                                )
+                                for result in batch_results:
+                                    if result["ok"]:
+                                        out_row = result["out_row"]
+                                        if self.short and self.include_count:
+                                            lemma = result["lemma"]
+                                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                            out_row["lemma_count"] = str(lemma_counts[lemma])
+                                        ws.append([_clean_cell(out_row.get(col, "")) for col in out_fieldnames])
+                                        processed += 1
+                                    else:
+                                        skipped += 1
+                                        if skipped <= 5:
+                                            self.progress_update.emit(f"⚠ Skipping row: {result['error'][:50]}")
+                                self.progress_value.emit(batch_bytes, total_bytes)
+                                if self._cancelled:
+                                    self.progress_update.emit("Cancellation requested. Stopping running batches...")
+                                    _terminate_process_pool(executor, self.progress_update.emit)
+                                    raise KeyboardInterrupt("User cancelled")
 
                         _write_groups_sheet_openpyxl(wb, group_labels, lemma_to_groups)
                         wb.save(str(self.output_csv_path))
 
                     else:
+                        self.progress_update.emit("Opening output CSV for writing...")
                         with self.output_csv_path.open("w", newline="", encoding=self.encoding) as fout:
                             writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
                             writer.writeheader()
-
-                            for row in reader:
-                                try:
-                                    lemma = (row.get(self.lemma_col) or "").strip()
-                                    if not lemma:
-                                        raise ValueError("Empty lemma")
-
-                                    group_sums: Dict[str, float] = {g: 0.0 for g in group_labels}
-
-                                    for i in range(1, k + 1):
-                                        tok = row.get(f"token_{i}", "")
-                                        p_str = row.get(f"prob_{i}", "")
-                                        if not tok or not p_str:
-                                            continue
-                                        try:
-                                            prob = float(p_str)
-                                        except ValueError:
-                                            continue
-
-                                        key = normalize_pred_token(tok)
-                                        gs = lemma_to_groups.get(key)
-                                        if not gs:
-                                            continue
-                                        for g in gs:
-                                            group_sums[g] += prob
-
-                                    if self.short:
-                                        out_row = {self.lemma_col: lemma}
-                                        for g in group_labels:
-                                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-                                        if self.include_count:
-                                            lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
-                                            out_row["lemma_count"] = str(lemma_counts[lemma])
-                                    else:
-                                        out_row = dict(row)
-                                        for g in group_labels:
-                                            out_row[group_colname_map[g]] = f"{group_sums[g]:.10g}"
-
-                                    writer.writerow(out_row)
-                                    processed += 1
-                                    if total_rows:
-                                        if processed % 1000 == 0 or processed == total_rows:
-                                            self.progress_value.emit(processed, total_rows)
-                                    
-                                    # Check for cancellation
+                            self.progress_update.emit("Preparing MLM row batches...")
+                            row_batches = _iter_row_batches_with_offsets(reader, fin, self.chunk_size)
+                            self.progress_update.emit("Resetting progress before batch loading...")
+                            self.progress_value.emit(0, total_bytes)
+                            self.progress_update.emit("Starting worker pool and queueing initial batches...")
+                            with ProcessPoolExecutor(
+                                max_workers=self.worker_count,
+                                initializer=_init_aggregation_worker,
+                                initargs=(group_labels, lemma_to_groups, k, self.lemma_col, self.short, group_colname_map),
+                            ) as executor:
+                                pending = deque()
+                                max_pending = max(1, self.worker_count * 2)
+                                for batch, bytes_read in row_batches:
+                                    pending.append((executor.submit(_process_aggregation_batch, batch), bytes_read))
+                                    if len(pending) < max_pending:
+                                        continue
+                                    future, batch_bytes = pending.popleft()
+                                    batch_results = _get_future_result_with_cancellation(
+                                        future,
+                                        executor,
+                                        lambda: self._cancelled,
+                                        self.progress_update.emit,
+                                    )
+                                    for result in batch_results:
+                                        if result["ok"]:
+                                            out_row = result["out_row"]
+                                            if self.short and self.include_count:
+                                                lemma = result["lemma"]
+                                                lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                                out_row["lemma_count"] = str(lemma_counts[lemma])
+                                            writer.writerow(out_row)
+                                            processed += 1
+                                        else:
+                                            skipped += 1
+                                            if skipped <= 5:
+                                                self.progress_update.emit(f"⚠ Skipping row: {result['error'][:50]}")
+                                    self.progress_value.emit(batch_bytes, total_bytes)
                                     if self._cancelled:
-                                        self.progress_update.emit("Cancellation requested...")
+                                        self.progress_update.emit("Cancellation requested. Stopping running batches...")
+                                        _terminate_process_pool(executor, self.progress_update.emit)
                                         raise KeyboardInterrupt("User cancelled")
-
-                                except Exception as e:
-                                    skipped += 1
-                                    if skipped <= 5:
-                                        self.progress_update.emit(f"⚠ Skipping row: {str(e)[:50]}")
-                                    continue
+                                while pending:
+                                    future, batch_bytes = pending.popleft()
+                                    batch_results = _get_future_result_with_cancellation(
+                                        future,
+                                        executor,
+                                        lambda: self._cancelled,
+                                        self.progress_update.emit,
+                                    )
+                                    for result in batch_results:
+                                        if result["ok"]:
+                                            out_row = result["out_row"]
+                                            if self.short and self.include_count:
+                                                lemma = result["lemma"]
+                                                lemma_counts[lemma] = lemma_counts.get(lemma, 0) + 1
+                                                out_row["lemma_count"] = str(lemma_counts[lemma])
+                                            writer.writerow(out_row)
+                                            processed += 1
+                                        else:
+                                            skipped += 1
+                                            if skipped <= 5:
+                                                self.progress_update.emit(f"⚠ Skipping row: {result['error'][:50]}")
+                                    self.progress_value.emit(batch_bytes, total_bytes)
+                                    if self._cancelled:
+                                        self.progress_update.emit("Cancellation requested. Stopping running batches...")
+                                        _terminate_process_pool(executor, self.progress_update.emit)
+                                        raise KeyboardInterrupt("User cancelled")
                 
                 # Save metadata
                 self.progress_update.emit("Computing checksums and saving metadata...")
-                if total_rows:
-                    self.progress_value.emit(processed, processed)
+                self.progress_value.emit(total_bytes, total_bytes)
                 mlm_checksum = compute_file_md5(self.mlm_csv_path)
                 group_checksum = compute_file_md5(self.group_csv_path)
                 output_checksum = compute_file_md5(self.output_csv_path)
-                
-                aggregation_settings = {
-                    "top_k": k,
-                    "lemma_col": self.lemma_col,
-                    "short": self.short,
-                    "include_count": self.include_count,
-                    "encoding": self.encoding,
-                    "output_format": "xlsx" if self.output_csv_path.suffix.lower() == ".xlsx" else "csv",
-                }
                 
                 stats = {
                     "rows_written": processed,
                     "rows_skipped": skipped,
                     "groups_created": len(group_labels),
+                    "elapsed_seconds": round(time.time() - start_time, 2),
                 }
                 
                 save_aggregation_metadata(
@@ -974,6 +1261,7 @@ def run_gui() -> None:
                     stats,
                     group_labels,
                     lemma_to_groups,
+                    None,
                     None,
                 )
                 
@@ -989,19 +1277,11 @@ def run_gui() -> None:
                     group_checksum = compute_file_md5(self.group_csv_path)
                     output_checksum = compute_file_md5(self.output_csv_path) if self.output_csv_path.exists() else ""
                     
-                    aggregation_settings = {
-                        "top_k": k,
-                        "lemma_col": self.lemma_col,
-                        "short": self.short,
-                        "include_count": self.include_count,
-                        "encoding": self.encoding,
-                        "output_format": "xlsx" if self.output_csv_path.suffix.lower() == ".xlsx" else "csv",
-                    }
-                    
                     stats = {
                         "rows_written": processed,
                         "rows_skipped": skipped,
                         "groups_created": len(group_labels),
+                        "elapsed_seconds": round(time.time() - start_time, 2),
                         "incomplete": True,
                     }
                     
@@ -1017,8 +1297,12 @@ def run_gui() -> None:
                         group_labels,
                         lemma_to_groups,
                         None,
+                        None,
+                        "stopped_by_user",
                     )
-                    self.progress_update.emit(f"✓ Saved incomplete metadata: {self.output_csv_path.with_suffix('.json')}")
+                    self.progress_update.emit(
+                        f"Saved metadata {self.output_csv_path.with_suffix('.json').name}"
+                    )
                 except Exception as meta_err:
                     self.progress_update.emit(f"⚠ Failed to save metadata: {meta_err}")
                 
@@ -1106,6 +1390,15 @@ def run_gui() -> None:
             self.topk_spin.setValue(0)
             self.topk_spin.setToolTip("0 = infer from MLM CSV header")
             top_k_layout.addWidget(self.topk_spin)
+
+            workers_layout = QVBoxLayout()
+            workers_layout.addWidget(QLabel("Worker Processes:"))
+            self.workers_spin = QSpinBox()
+            self.workers_spin.setMinimum(1)
+            self.workers_spin.setMaximum(max(1, os.cpu_count() or 1))
+            self.workers_spin.setValue(default_worker_count())
+            self.workers_spin.setToolTip("Default leaves 2 CPU cores free to keep the system responsive")
+            workers_layout.addWidget(self.workers_spin)
             
             lemma_col_layout = QVBoxLayout()
             lemma_col_layout.addWidget(QLabel("Lemma Column:"))
@@ -1113,6 +1406,7 @@ def run_gui() -> None:
             lemma_col_layout.addWidget(self.lemma_col_input)
             
             options_layout.addLayout(top_k_layout)
+            options_layout.addLayout(workers_layout)
             options_layout.addLayout(lemma_col_layout)
             options_layout.addStretch()
             settings_layout.addLayout(options_layout)
@@ -1217,6 +1511,7 @@ def run_gui() -> None:
                         self.mlm_input.setText(metadata.get("output_file", ""))
                     # User must provide group CSV and output file
                     self.topk_spin.setValue(settings.get("top_k", 0))
+                    self.workers_spin.setValue(settings.get("workers", default_worker_count()))
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
                     self.short_check.setChecked(settings.get("short", False))
                     self.count_check.setChecked(settings.get("include_count", False))
@@ -1229,6 +1524,7 @@ def run_gui() -> None:
                     if metadata.get("output_file"):
                         self.output_input.setText(metadata.get("output_file", ""))
                     self.topk_spin.setValue(settings.get("top_k", 0))
+                    self.workers_spin.setValue(settings.get("workers", default_worker_count()))
                     self.lemma_col_input.setText(settings.get("lemma_col", "lemma"))
                     self.short_check.setChecked(settings.get("short", False))
                     self.count_check.setChecked(settings.get("include_count", False))
@@ -1251,13 +1547,15 @@ def run_gui() -> None:
                 self.progress_bar.setValue(0)
                 self.progress_label.setText("Processing...")
                 return
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(processed)
-            self.progress_bar.setFormat(f"{processed:,}/{total:,} rows")
-            
-            # Update progress label with percentage and rate
-            percent = (processed / total) * 100 if total > 0 else 0
-            self.progress_label.setText(f"Processing: {processed:,} / {total:,} rows ({percent:.1f}%)")
+            progress_bytes = min(processed, total)
+            permille = min(1000, int((progress_bytes / total) * 1000))
+            percent = (progress_bytes / total) * 100
+            self.progress_bar.setMaximum(1000)
+            self.progress_bar.setValue(permille)
+            self.progress_bar.setFormat(f"{percent:.1f}%")
+            self.progress_label.setText(
+                f"Processing: {_format_bytes(progress_bytes)} / {_format_bytes(total)} ({percent:.1f}%)"
+            )
         
         def toggle_aggregation(self):
             """Start or stop the aggregation process."""
@@ -1295,9 +1593,10 @@ def run_gui() -> None:
             self.log(f"MLM CSV: {mlm_path}")
             self.log(f"Group CSV: {group_path}")
             self.log(f"Output: {output_path}")
+            self.log(f"Worker Processes: {self.workers_spin.value()}")
             self.log("")
             
-            self.start_btn.setEnabled(False)
+            self.start_btn.setEnabled(True)
             self.progress_bar.setMaximum(0)
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("")
@@ -1315,6 +1614,7 @@ def run_gui() -> None:
                 self.short_check.isChecked(),
                 self.count_check.isChecked(),
                 "utf-8-sig",
+                self.workers_spin.value(),
             )
             
             self.worker.progress_update.connect(self.log)
