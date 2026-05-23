@@ -10,13 +10,25 @@ Output:
 
 Excel sheets:
   1) lemma_to_groups:
-        lemma → mean group probabilities (formatted as %) + count
+        lemma → mean group probabilities (formatted as %) + max_prob + Group + Importance + count
         - bold the highest group percentage in each row
+        - italicize lemma cells when the lemma is explicitly listed in at least
+          one source group in the metadata, if available
         - color the lemma cell BLUE if the 2nd-highest group percentage is at least
           --second-threshold (default 0.50) times the highest
+        - Group shows the max-probability group, or for blue lemmas a comma-separated
+          list of all groups with probability >= second-threshold * max_prob
   2) groups_ranked:
         for each group: (lemma, pct) sorted by decreasing pct,
         with the lemma bolded in the group where it has the highest probability
+        - italicize lemma cells when the lemma is explicitly listed in that
+          group in the source group file metadata, if available
+  3) group_overlap:
+        square matrix of groups × groups where each cell is
+        sum_lemma min(P(lemma in group_i), P(lemma in group_j))
+  4) auto_groups:
+        optional Excel-only sheet listing newly constructed groups in columns,
+        using an importance cutoff and optional ambiguous-lemma exclusion
 
 Auto-detection:
   - If --group-cols is provided, use it.
@@ -37,6 +49,7 @@ import os
 import re
 import sys
 import time
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +65,7 @@ except ImportError:
     OPENPYXL_AVAILABLE = False
 
 PROB_COL_RE = re.compile(r"^prob_(\d+)$")
+OVERLAP_MEASURES = {"intersection", "correlation", "cosine"}
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -91,6 +105,15 @@ def reconstruct_command(input_csv: str, output_file: str, args: argparse.Namespa
         cmd.extend(["--group-cols", *args.group_cols])
     if args.second_threshold != 0.50:
         cmd.extend(["--second-threshold", str(args.second_threshold)])
+    if getattr(args, "auto_groups", False):
+        cmd.append("--auto-groups")
+        cmd.extend(["--importance-cutoff", str(args.importance_cutoff)])
+    if not getattr(args, "ignore_ambiguous_auto_groups", True):
+        cmd.append("--include-ambiguous-auto-groups")
+    if getattr(args, "overlap_measure", "intersection") != "intersection":
+        cmd.extend(["--overlap-measure", args.overlap_measure])
+    if getattr(args, "vba_links", False):
+        cmd.append("--vba-links")
     if args.encoding != "utf-8":
         cmd.extend(["--encoding", args.encoding])
     if args.load_metadata:
@@ -125,8 +148,13 @@ def save_metadata(
             "lemma_col": args.get("lemma_col", "lemma"),
             "group_cols": group_cols,
             "second_threshold": args.get("second_threshold", 0.50),
+            "auto_groups": args.get("auto_groups", False),
+            "importance_cutoff": args.get("importance_cutoff", 0.0),
+            "ignore_ambiguous_auto_groups": args.get("ignore_ambiguous_auto_groups", True),
+            "overlap_measure": args.get("overlap_measure", "intersection"),
             "encoding": args.get("encoding", "utf-8"),
-            "output_format": "xlsx" if str(output_path).lower().endswith(".xlsx") else "csv",
+            "output_format": output_path.suffix.lower().lstrip("."),
+            "vba_links": args.get("vba_links", False),
         },
         "statistics": stats,
     }
@@ -159,13 +187,226 @@ def infer_group_cols(fieldnames: List[str]) -> List[str]:
             last_prob_idx = i
     if last_prob_idx == -1:
         return []
-    return [c for c in fieldnames[last_prob_idx + 1:] if c.strip()]
+    return [clean_group_col_name(c) for c in fieldnames[last_prob_idx + 1:] if c.strip()]
+
+
+def clean_group_col_name(name: str) -> str:
+    """Normalize a group column name for display/metadata matching."""
+    stripped = name.strip()
+    if stripped.startswith("group_prob_"):
+        return stripped[len("group_prob_"):]
+    return stripped
 
 
 def safe_sheet_title(s: str) -> str:
     bad = r'[]:*?/\\'
     out = "".join("_" if ch in bad else ch for ch in s)
     return out[:31]
+
+
+def extract_group_membership_from_metadata(
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, set[str]]:
+    """Extract group -> lemma membership mapping from chained metadata, if present."""
+    if not metadata:
+        return {}
+
+    groups = metadata.get("groups")
+    if not isinstance(groups, dict):
+        nested = metadata.get("source_metadata")
+        if isinstance(nested, dict):
+            return extract_group_membership_from_metadata(nested)
+        return {}
+
+    membership: Dict[str, set[str]] = {}
+    for group_name, lemmas in groups.items():
+        if isinstance(lemmas, list):
+            membership[str(group_name)] = {
+                str(lemma).strip() for lemma in lemmas if str(lemma).strip()
+            }
+    return membership
+
+
+def load_input_sidecar_metadata(input_path: Path) -> Optional[Dict[str, Any]]:
+    """Load metadata JSON adjacent to the current input CSV, if present."""
+    meta_path = input_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def compute_group_matrix(
+    group_cols: List[str],
+    counts: Dict[str, int],
+    means: Dict[str, Dict[str, float]],
+    overlap_measure: str,
+) -> Dict[str, Dict[str, float]]:
+    """Compute a group-by-group matrix using the requested similarity measure."""
+    if overlap_measure not in OVERLAP_MEASURES:
+        raise ValueError(f"Unsupported overlap measure: {overlap_measure}")
+
+    lemmas = list(counts.keys())
+    matrix: Dict[str, Dict[str, float]] = {}
+
+    for g1 in group_cols:
+        row: Dict[str, float] = {}
+        v1 = [means[g1][lemma] for lemma in lemmas]
+        mean1 = sum(v1) / len(v1) if v1 else 0.0
+        norm1 = math.sqrt(sum(x * x for x in v1))
+
+        for g2 in group_cols:
+            v2 = [means[g2][lemma] for lemma in lemmas]
+
+            if overlap_measure == "intersection":
+                row[g2] = sum(min(a, b) for a, b in zip(v1, v2))
+            elif overlap_measure == "correlation":
+                mean2 = sum(v2) / len(v2) if v2 else 0.0
+                num = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
+                den1 = math.sqrt(sum((a - mean1) ** 2 for a in v1))
+                den2 = math.sqrt(sum((b - mean2) ** 2 for b in v2))
+                row[g2] = num / (den1 * den2) if den1 > 0 and den2 > 0 else 0.0
+            else:  # cosine
+                norm2 = math.sqrt(sum(x * x for x in v2))
+                dot = sum(a * b for a, b in zip(v1, v2))
+                row[g2] = dot / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0.0
+
+        matrix[g1] = row
+
+    return matrix
+
+
+def format_group_label(
+    lemma: str,
+    group_cols: List[str],
+    means: Dict[str, Dict[str, float]],
+    second_threshold: float,
+) -> Tuple[str, str, float, float]:
+    """Return group label plus max-group stats for a lemma."""
+    group_vals = [(g, means[g][lemma]) for g in group_cols]
+    group_vals.sort(key=lambda x: x[1], reverse=True)
+    max_g, max_v = group_vals[0]
+    second_v = group_vals[1][1] if len(group_vals) > 1 else 0.0
+
+    if max_v > 0 and second_v >= (second_threshold * max_v):
+        group_label = ", ".join(
+            g for g, v in group_vals if v >= (second_threshold * max_v)
+        )
+    else:
+        group_label = max_g
+
+    return group_label, max_g, max_v, second_v
+
+
+def excel_string_literal(value: str) -> str:
+    """Return an Excel string literal with embedded quotes escaped."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def build_internal_hyperlink_formula(display_text: str, target_sheet_title: str) -> str:
+    """Build a formula hyperlink that finds the lemma row dynamically on Sheet 1."""
+    display_literal = excel_string_literal(display_text)
+    sheet_literal = target_sheet_title.replace("'", "''")
+    return (
+        f'=HYPERLINK('
+        f'"#\'{sheet_literal}\'!A"&MATCH({display_literal},\'{sheet_literal}\'!A:A,0),'
+        f'{display_literal}'
+        f')'
+    )
+
+
+def output_mode_from_suffix(suffix: str) -> str:
+    """Map an output suffix to the GUI output mode."""
+    suffix = suffix.lower()
+    if suffix == ".csv":
+        return ".csv"
+    if suffix == ".tsv":
+        return ".tsv"
+    return "excel"
+
+
+def compute_importance(count: int, max_prob: float) -> float:
+    """Compute lemma importance from count and max probability."""
+    return math.log10(count) * max_prob
+
+
+def build_auto_group_assignments(
+    group_cols: List[str],
+    counts: Dict[str, int],
+    means: Dict[str, Dict[str, float]],
+    second_threshold: float,
+    importance_cutoff: float,
+    ignore_ambiguous: bool,
+) -> Dict[str, List[str]]:
+    """Assign lemmas to auto-groups based on importance and ambiguity rules."""
+    assignments: Dict[str, List[Tuple[str, float, float]]] = {g: [] for g in group_cols}
+
+    for lemma in sorted(counts):
+        _group_label, max_g, max_v, second_v = format_group_label(
+            lemma, group_cols, means, second_threshold
+        )
+        importance = compute_importance(counts[lemma], max_v)
+        is_ambiguous = max_v > 0 and second_v >= (second_threshold * max_v)
+
+        if importance < importance_cutoff:
+            continue
+        if is_ambiguous and ignore_ambiguous:
+            continue
+
+        assignments[max_g].append((lemma, importance, max_v))
+
+    ordered: Dict[str, List[str]] = {}
+    for group_name in group_cols:
+        items = assignments[group_name]
+        items.sort(key=lambda x: (-x[1], -x[2], x[0]))
+        ordered[group_name] = [lemma for lemma, _importance, _max_v in items]
+
+    return ordered
+
+
+def append_auto_groups_sheet(
+    wb: Workbook,
+    group_cols: List[str],
+    counts: Dict[str, int],
+    means: Dict[str, Dict[str, float]],
+    second_threshold: float,
+    importance_cutoff: float,
+    ignore_ambiguous: bool,
+    header_font: Optional[Font] = None,
+    header_align: Optional[Alignment] = None,
+) -> None:
+    """Append the optional auto_groups sheet."""
+    ws = wb.create_sheet(title=safe_sheet_title("auto_groups"))
+    assignments = build_auto_group_assignments(
+        group_cols=group_cols,
+        counts=counts,
+        means=means,
+        second_threshold=second_threshold,
+        importance_cutoff=importance_cutoff,
+        ignore_ambiguous=ignore_ambiguous,
+    )
+
+    ws.append(group_cols)
+    if header_font is not None and header_align is not None:
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.alignment = header_align
+
+    max_len = max((len(assignments[g]) for g in group_cols), default=0)
+    for row_idx in range(max_len):
+        row = []
+        for group_name in group_cols:
+            if row_idx < len(assignments[group_name]):
+                row.append(assignments[group_name][row_idx])
+            else:
+                row.append(None)
+        ws.append(row)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
 
 # ------------------------- Excel writer -------------------------
@@ -178,6 +419,12 @@ def write_excel(
     means: Dict[str, Dict[str, float]],
     best_group_for_lemma: Dict[str, str],
     second_threshold: float,
+    overlap_measure: str,
+    group_membership: Optional[Dict[str, set[str]]] = None,
+    use_vba_links: bool = False,
+    auto_groups: bool = False,
+    importance_cutoff: float = 0.0,
+    ignore_ambiguous_auto_groups: bool = True,
 ) -> None:
     """
     Write Excel output. For large datasets, use CSV instead - Excel formatting
@@ -194,6 +441,13 @@ def write_excel(
         )
     
     logger.debug("write_excel: openpyxl is available (imported at module level)")
+
+    overlap_matrix = compute_group_matrix(group_cols, counts, means, overlap_measure)
+    if use_vba_links:
+        logger.warning(
+            "write_excel: VBA link mode requested, but workbook macros are not generated in-code; "
+            "writing .xlsm-compatible workbook with formula-based internal links."
+        )
 
     # For very large datasets, warn and limit formatting
     total_lemmas = len(counts)
@@ -214,7 +468,7 @@ def write_excel(
             
             # Header
             logger.debug("write_excel: writing Sheet 1 header")
-            header = [lemma_col] + group_cols + ["count"]
+            header = [lemma_col] + group_cols + ["max_prob", "Group", "Importance", "count"]
             ws1.append(header)
             
             # Data rows only
@@ -222,7 +476,11 @@ def write_excel(
             for i, lemma in enumerate(sorted(counts)):
                 if i % 10000 == 0 and i > 0:
                     logger.info("write_excel: written %d/%d rows", i, total_lemmas)
-                row_vals = [lemma] + [means[g][lemma] for g in group_cols] + [counts[lemma]]
+                group_label, _max_g, max_prob, _second_v = format_group_label(
+                    lemma, group_cols, means, second_threshold
+                )
+                importance = compute_importance(counts[lemma], max_prob)
+                row_vals = [lemma] + [means[g][lemma] for g in group_cols] + [max_prob, group_label, importance, counts[lemma]]
                 ws1.append(row_vals)
             
             # Sheet 2
@@ -245,6 +503,7 @@ def write_excel(
             ws2.append(header2_simple)
             
             logger.debug("write_excel: writing %d rows to Sheet 2", max_len)
+            sheet1_title = ws1.title
             for r in range(max_len):
                 if r % 10000 == 0 and r > 0:
                     logger.info("write_excel: written %d/%d rows", r, max_len)
@@ -252,10 +511,28 @@ def write_excel(
                 for g in group_cols:
                     if r < len(per_group_sorted_simple[g]):
                         lemma, pct = per_group_sorted_simple[g][r]
-                        row_data.extend([lemma, pct])
+                        row_data.extend([build_internal_hyperlink_formula(lemma, sheet1_title), pct])
                     else:
                         row_data.extend([None, None])
                 ws2.append(row_data)
+
+            # Sheet 3
+            logger.debug("write_excel: creating Sheet 3")
+            ws3 = wb.create_sheet(title=safe_sheet_title("group_overlap"))
+            ws3.append(["group"] + group_cols)
+            for g1 in group_cols:
+                ws3.append([g1] + [overlap_matrix[g1][g2] for g2 in group_cols])
+
+            if auto_groups:
+                append_auto_groups_sheet(
+                    wb=wb,
+                    group_cols=group_cols,
+                    counts=counts,
+                    means=means,
+                    second_threshold=second_threshold,
+                    importance_cutoff=importance_cutoff,
+                    ignore_ambiguous=ignore_ambiguous_auto_groups,
+                )
             
             logger.debug("write_excel: saving workbook to %s", xlsx_path)
             wb.save(xlsx_path)
@@ -265,8 +542,12 @@ def write_excel(
         logger.debug("write_excel: using formatted Excel output")
         wb = Workbook()
         bold_font = Font(bold=True)
+        italic_font = Font(italic=True)
         blue_font = Font(color="0000FF")  # blue text
+        italic_blue_font = Font(italic=True, color="0000FF")
+        bold_italic_font = Font(bold=True, italic=True)
         bold_blue_font = Font(bold=True, color="0000FF")
+        bold_italic_blue_font = Font(bold=True, italic=True, color="0000FF")
         header_font = Font(bold=True)
         header_align = Alignment(vertical="center")
 
@@ -274,7 +555,7 @@ def write_excel(
         ws1 = wb.active
         ws1.title = safe_sheet_title("lemma_to_groups")
 
-        header = [lemma_col] + group_cols + ["count"]
+        header = [lemma_col] + group_cols + ["max_prob", "Group", "Importance", "count"]
         ws1.append(header)
         for cell in ws1[1]:
             cell.font = header_font
@@ -287,30 +568,36 @@ def write_excel(
         #   count = last
         ambiguous_lemmas = set()
         for lemma in sorted(counts):
-            row_vals = [lemma] + [means[g][lemma] for g in group_cols] + [counts[lemma]]
+            group_label, max_g, max_v, second_v = format_group_label(
+                lemma, group_cols, means, second_threshold
+            )
+            max_prob = max_v
+            importance = compute_importance(counts[lemma], max_prob)
+            row_vals = [lemma] + [means[g][lemma] for g in group_cols] + [max_prob, group_label, importance, counts[lemma]]
             ws1.append(row_vals)
             r = ws1.max_row
-
-            # Determine max/2nd-max across groups for this lemma
-            group_vals = [(g, means[g][lemma]) for g in group_cols]
-            # stable sort: highest first
-            group_vals.sort(key=lambda x: x[1], reverse=True)
-            max_g, max_v = group_vals[0]
-            second_v = group_vals[1][1] if len(group_vals) > 1 else 0.0
+            is_in_any_source_group = (
+                group_membership is not None and
+                any(lemma in members for members in group_membership.values())
+            )
 
             # Bold the max group cell in this row
             max_idx = group_cols.index(max_g)  # 0-based within group_cols
             max_col = 2 + max_idx  # Excel column index for the group cell
             ws1.cell(row=r, column=max_col).font = bold_font
 
+            lemma_cell = ws1.cell(row=r, column=1)
+            if is_in_any_source_group:
+                lemma_cell.font = italic_font
+
             # If 2nd-highest >= threshold * highest, color lemma cell blue
             # Avoid dividing by zero: if max_v == 0, treat as "not ambiguous"
             if max_v > 0 and second_v >= (second_threshold * max_v):
-                ws1.cell(row=r, column=1).font = blue_font
+                lemma_cell.font = italic_blue_font if is_in_any_source_group else blue_font
                 ambiguous_lemmas.add(lemma)
 
-        # Percent formatting for group columns
-        for j in range(2, 2 + len(group_cols)):
+        # Percent formatting for group columns + max_prob
+        for j in range(2, 3 + len(group_cols)):
             for i in range(2, ws1.max_row + 1):
                 ws1.cell(row=i, column=j).number_format = "0.00%"
 
@@ -336,12 +623,13 @@ def write_excel(
             cell.font = header_font
             cell.alignment = header_align
 
+        sheet1_title = ws1.title
         for r in range(max_len):
             row_data = []
             for k, g in enumerate(group_cols):
                 if r < len(per_group_sorted[g]):
                     lemma, pct = per_group_sorted[g][r]
-                    row_data.extend([lemma, pct])
+                    row_data.extend([build_internal_hyperlink_formula(lemma, sheet1_title), pct])
                 else:
                     row_data.extend([None, None])
             ws2.append(row_data)
@@ -355,10 +643,22 @@ def write_excel(
                     cell_lemma = ws2.cell(row=excel_row, column=lemma_col_idx)
                     is_best = best_group_for_lemma.get(lemma) == g
                     is_ambiguous = lemma in ambiguous_lemmas
-                    if is_best and is_ambiguous:
+                    is_in_source_group = (
+                        group_membership is not None and
+                        lemma in group_membership.get(g, set())
+                    )
+                    if is_best and is_ambiguous and is_in_source_group:
+                        cell_lemma.font = bold_italic_blue_font
+                    elif is_best and is_ambiguous:
                         cell_lemma.font = bold_blue_font
+                    elif is_best and is_in_source_group:
+                        cell_lemma.font = bold_italic_font
+                    elif is_ambiguous and is_in_source_group:
+                        cell_lemma.font = italic_blue_font
                     elif is_best:
                         cell_lemma.font = bold_font
+                    elif is_in_source_group:
+                        cell_lemma.font = italic_font
                     elif is_ambiguous:
                         cell_lemma.font = blue_font
 
@@ -368,6 +668,40 @@ def write_excel(
 
         ws2.freeze_panes = "A2"
         ws2.auto_filter.ref = f"A1:{get_column_letter(ws2.max_column)}{ws2.max_row}"
+
+        # ---------- Sheet 3: group_overlap ----------
+        ws3 = wb.create_sheet(title=safe_sheet_title("group_overlap"))
+        ws3.append(["group"] + group_cols)
+        for cell in ws3[1]:
+            cell.font = header_font
+            cell.alignment = header_align
+
+        for g1 in group_cols:
+            ws3.append([g1] + [overlap_matrix[g1][g2] for g2 in group_cols])
+            r = ws3.max_row
+            ws3.cell(row=r, column=1).font = header_font
+            ws3.cell(row=r, column=1).alignment = header_align
+
+        matrix_number_format = "0.00%" if overlap_measure == "intersection" else "0.0000"
+        for col in range(2, ws3.max_column + 1):
+            for i in range(2, ws3.max_row + 1):
+                ws3.cell(row=i, column=col).number_format = matrix_number_format
+
+        ws3.freeze_panes = "B2"
+        ws3.auto_filter.ref = f"A1:{get_column_letter(ws3.max_column)}{ws3.max_row}"
+
+        if auto_groups:
+            append_auto_groups_sheet(
+                wb=wb,
+                group_cols=group_cols,
+                counts=counts,
+                means=means,
+                second_threshold=second_threshold,
+                importance_cutoff=importance_cutoff,
+                ignore_ambiguous=ignore_ambiguous_auto_groups,
+                header_font=header_font,
+                header_align=header_align,
+            )
 
         logger.debug("write_excel: saving workbook (formatted version)")
         wb.save(xlsx_path)
@@ -402,7 +736,7 @@ def run_cli(
     
     ap = argparse.ArgumentParser(description="Aggregate group probabilities by lemma")
     ap.add_argument("input_csv", help="Input CSV file with group probability columns")
-    ap.add_argument("output", help="Output filename (.csv or .xlsx)")
+    ap.add_argument("output", help="Output filename (.csv, .tsv, .xlsx, or .xlsm)")
     ap.add_argument("--lemma-col", default="lemma", help="Lemma column name (default: lemma)")
     ap.add_argument(
         "--group-cols",
@@ -416,16 +750,49 @@ def run_cli(
         default=0.50,
         help="Color lemma blue if 2nd-best >= threshold * best (default: 0.50)",
     )
+    ap.add_argument(
+        "--auto-groups",
+        action="store_true",
+        help="Add an Excel-only auto_groups sheet using importance-based assignment.",
+    )
+    ap.add_argument(
+        "--importance-cutoff",
+        type=float,
+        default=0.0,
+        help="Minimum importance for auto-group assignment (default: 0.0).",
+    )
+    ap.add_argument(
+        "--include-ambiguous-auto-groups",
+        action="store_true",
+        help="Include ambiguous lemmas in auto_groups by assigning them to their top group.",
+    )
+    ap.add_argument(
+        "--overlap-measure",
+        default="intersection",
+        choices=sorted(OVERLAP_MEASURES),
+        help="Matrix measure for the third sheet: intersection, correlation, or cosine (default: intersection)",
+    )
+    ap.add_argument(
+        "--vba-links",
+        action="store_true",
+        help="Write Excel output as .xlsm and reserve VBA link mode; currently still uses formula-based hyperlinks.",
+    )
     ap.add_argument("--encoding", default="utf-8-sig", help="Input file encoding (default: utf-8-sig to handle BOM)")
     ap.add_argument("--load-metadata", help="Load settings from metadata JSON (e.g., MLMGroupAggregator or previous run)")
     parsed = ap.parse_args(args=argv)
+    explicit_group_cols = parsed.group_cols is not None
 
     if not (0.0 <= parsed.second_threshold <= 1.0):
         raise SystemExit("--second-threshold must be between 0 and 1.")
+    if parsed.importance_cutoff < 0.0:
+        raise SystemExit("--importance-cutoff must be non-negative.")
+
+    if parsed.vba_links and parsed.output.lower().endswith(".xlsx"):
+        parsed.output = str(Path(parsed.output).with_suffix(".xlsm"))
 
     out_ext = os.path.splitext(parsed.output)[1].lower()
-    if out_ext not in {".csv", ".xlsx"}:
-        raise SystemExit("Output filename must end with .csv or .xlsx")
+    if out_ext not in {".csv", ".tsv", ".xlsx", ".xlsm"}:
+        raise SystemExit("Output filename must end with .csv, .tsv, .xlsx, or .xlsm")
 
     source_metadata: Optional[Dict[str, Any]] = None
     if parsed.load_metadata:
@@ -441,9 +808,37 @@ def run_cli(
                     parsed.group_cols = list(source_metadata["groups"].keys())
             if not parsed.lemma_col and "settings" in source_metadata:
                 parsed.lemma_col = source_metadata.get("settings", {}).get("lemma_col", parsed.lemma_col)
+            if (
+                parsed.overlap_measure == "intersection" and
+                "settings" in source_metadata and
+                isinstance(source_metadata.get("settings"), dict)
+            ):
+                parsed.overlap_measure = source_metadata["settings"].get("overlap_measure", parsed.overlap_measure)
+            settings = source_metadata.get("settings", {})
+            if isinstance(settings, dict):
+                if not parsed.auto_groups:
+                    parsed.auto_groups = bool(settings.get("auto_groups", parsed.auto_groups))
+                if parsed.importance_cutoff == 0.0:
+                    parsed.importance_cutoff = float(settings.get("importance_cutoff", parsed.importance_cutoff))
+                if not parsed.include_ambiguous_auto_groups:
+                    parsed.include_ambiguous_auto_groups = not bool(
+                        settings.get("ignore_ambiguous_auto_groups", True)
+                    )
 
     input_path = Path(parsed.input_csv)
     output_path = Path(parsed.output)
+    input_sidecar_metadata = load_input_sidecar_metadata(input_path)
+    group_metadata_source = source_metadata
+    if (
+        input_sidecar_metadata is not None and
+        input_sidecar_metadata.get("tool") == "MLMGroupAggregator" and
+        isinstance(input_sidecar_metadata.get("groups"), dict)
+    ):
+        group_metadata_source = input_sidecar_metadata
+        if not explicit_group_cols:
+            parsed.group_cols = list(input_sidecar_metadata["groups"].keys())
+
+    group_membership = extract_group_membership_from_metadata(group_metadata_source)
 
     start_time = time.time()
     total_rows = 0
@@ -463,7 +858,7 @@ def run_cli(
         # Build mapping from clean group names to actual column names (which may have BOM)
         group_col_mapping = {}
         for gc in group_cols:
-            matching = [col for col in reader.fieldnames if gc in col]
+            matching = [col for col in reader.fieldnames if clean_group_col_name(col) == gc]
             if matching:
                 # Use the first match (should be exactly one)
                 group_col_mapping[gc] = matching[0]
@@ -513,21 +908,32 @@ def run_cli(
     log(f"Writing output to {output_path}...")
     log(f"Output format: {out_ext}")
     
-    if out_ext == ".csv":
-        log("Starting CSV write...")
+    if out_ext in {".csv", ".tsv"}:
+        delimiter = "," if out_ext == ".csv" else "\t"
+        log(f"Starting {'CSV' if out_ext == '.csv' else 'TSV'} write...")
         with output_path.open("w", newline="", encoding=parsed.encoding) as fout:
-            log("CSV file opened for writing")
+            log("Delimited text file opened for writing")
             writer = csv.DictWriter(
                 fout,
-                fieldnames=[parsed.lemma_col] + group_cols + ["count"],
+                fieldnames=[parsed.lemma_col] + group_cols + ["max_prob", "Group", "Importance", "count"],
+                delimiter=delimiter,
             )
-            log("Writing CSV header...")
+            log("Writing header...")
             writer.writeheader()
             log(f"Writing {len(counts)} data rows...")
             for i, lemma in enumerate(sorted(counts)):
                 if i % 1000 == 0 and i > 0:
-                    log(f"  Written {i}/{len(counts)} rows to CSV...")
-                row = {parsed.lemma_col: lemma, "count": counts[lemma]}
+                    log(f"  Written {i}/{len(counts)} rows...")
+                group_label, _max_g, max_prob, _second_v = format_group_label(
+                    lemma, group_cols, means, parsed.second_threshold
+                )
+                row = {
+                    parsed.lemma_col: lemma,
+                    "max_prob": f"{max_prob:.10g}",
+                    "Group": group_label,
+                    "Importance": f"{compute_importance(counts[lemma], max_prob):.10g}",
+                    "count": counts[lemma],
+                }
                 for g in group_cols:
                     row[g] = f"{means[g][lemma]:.10g}"
                 writer.writerow(row)
@@ -543,6 +949,12 @@ def run_cli(
                 means=means,
                 best_group_for_lemma=best_group_for_lemma,
                 second_threshold=parsed.second_threshold,
+                overlap_measure=parsed.overlap_measure,
+                group_membership=group_membership,
+                use_vba_links=parsed.vba_links,
+                auto_groups=parsed.auto_groups,
+                importance_cutoff=parsed.importance_cutoff,
+                ignore_ambiguous_auto_groups=not parsed.include_ambiguous_auto_groups,
             )
             log(f"✓ Wrote {output_path}")
         except Exception as e:
@@ -593,6 +1005,11 @@ def run_cli(
                 "lemma_col": parsed.lemma_col,
                 "group_cols": group_cols,
                 "second_threshold": parsed.second_threshold,
+                "auto_groups": parsed.auto_groups,
+                "importance_cutoff": parsed.importance_cutoff,
+                "ignore_ambiguous_auto_groups": not parsed.include_ambiguous_auto_groups,
+                "overlap_measure": parsed.overlap_measure,
+                "vba_links": parsed.vba_links,
                 "encoding": parsed.encoding,
             },
             stats=stats,
@@ -613,6 +1030,7 @@ def run_gui() -> None:
         from PySide6.QtCore import QThread, Signal
         from PySide6.QtWidgets import (
             QApplication,
+            QCheckBox,
             QComboBox,
             QFileDialog,
             QGridLayout,
@@ -638,13 +1056,18 @@ def run_gui() -> None:
         progress_value = Signal(int, int)
         finished = Signal(bool, str)
 
-        def __init__(self, input_path: Path, output_path: Path, lemma_col: str, group_cols: Optional[List[str]], second_threshold: float, encoding: str, metadata_path: Optional[Path]):
+        def __init__(self, input_path: Path, output_path: Path, lemma_col: str, group_cols: Optional[List[str]], second_threshold: float, overlap_measure: str, auto_groups: bool, importance_cutoff: float, ignore_ambiguous_auto_groups: bool, use_vba_links: bool, encoding: str, metadata_path: Optional[Path]):
             super().__init__()
             self.input_path = input_path
             self.output_path = output_path
             self.lemma_col = lemma_col
             self.group_cols = group_cols
             self.second_threshold = second_threshold
+            self.overlap_measure = overlap_measure
+            self.auto_groups = auto_groups
+            self.importance_cutoff = importance_cutoff
+            self.ignore_ambiguous_auto_groups = ignore_ambiguous_auto_groups
+            self.use_vba_links = use_vba_links
             self.encoding = encoding
             self.metadata_path = metadata_path
 
@@ -670,9 +1093,17 @@ def run_gui() -> None:
                     self.lemma_col,
                     "--second-threshold",
                     str(self.second_threshold),
+                    "--overlap-measure",
+                    self.overlap_measure,
                     "--encoding",
                     self.encoding,
                 ]
+                if self.auto_groups:
+                    argv.extend(["--auto-groups", "--importance-cutoff", str(self.importance_cutoff)])
+                    if not self.ignore_ambiguous_auto_groups:
+                        argv.append("--include-ambiguous-auto-groups")
+                if self.use_vba_links:
+                    argv.append("--vba-links")
                 if self.group_cols:
                     argv.extend(["--group-cols", *self.group_cols])
                 if self.metadata_path:
@@ -716,6 +1147,8 @@ def run_gui() -> None:
 
             self.input_edit = QLineEdit()
             self.output_edit = QLineEdit()
+            self.output_mode_combo = QComboBox()
+            self.output_mode_combo.addItems([".csv", ".tsv", "excel"])
             self.lemma_edit = QLineEdit("lemma")
             self.group_edit = QLineEdit()
             self.encoding_edit = QLineEdit("utf-8")
@@ -724,6 +1157,18 @@ def run_gui() -> None:
             self.second_spin.setRange(0, 100)
             self.second_spin.setValue(50)
             self.second_spin.setSuffix(" %")
+            self.overlap_combo = QComboBox()
+            self.overlap_combo.addItems(["intersection", "correlation", "cosine"])
+            self.auto_groups_check = QCheckBox("Auto group")
+            self.importance_cutoff_edit = QLineEdit("0.0")
+            self.ignore_ambiguous_check = QCheckBox("Ignore ambiguous verbs")
+            self.ignore_ambiguous_check.setChecked(True)
+            self.importance_cutoff_edit.setEnabled(False)
+            self.ignore_ambiguous_check.setEnabled(False)
+            self.vba_links_check = QCheckBox("VBA links (.xlsm)")
+            self.vba_links_check.setToolTip(
+                "Writes .xlsm output and reserves VBA link mode. Current export still uses formula-based hyperlinks."
+            )
             self.progress_bar = QProgressBar()
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
@@ -744,6 +1189,8 @@ def run_gui() -> None:
             browse_out.clicked.connect(self.pick_output)
             load_json_btn.clicked.connect(self.pick_metadata)
             run_btn.clicked.connect(self.start)
+            self.auto_groups_check.toggled.connect(self.update_auto_group_controls)
+            self.output_mode_combo.currentTextChanged.connect(self.update_output_controls)
 
             # File paths section
             file_grid = QGridLayout()
@@ -753,6 +1200,8 @@ def run_gui() -> None:
             file_grid.addWidget(QLabel("Output File:"), 1, 0)
             file_grid.addWidget(self.output_edit, 1, 1)
             file_grid.addWidget(browse_out, 1, 2)
+            file_grid.addWidget(QLabel("Output Type:"), 2, 0)
+            file_grid.addWidget(self.output_mode_combo, 2, 1, 1, 2)
 
             # Settings section
             settings_box = QGroupBox("Settings")
@@ -778,6 +1227,20 @@ def run_gui() -> None:
             second_layout = QVBoxLayout()
             second_layout.addWidget(QLabel("Second Threshold (% of top):"))
             second_layout.addWidget(self.second_spin)
+
+            overlap_layout = QVBoxLayout()
+            overlap_layout.addWidget(QLabel("Matrix Measure:"))
+            overlap_layout.addWidget(self.overlap_combo)
+
+            auto_group_layout = QVBoxLayout()
+            auto_group_layout.addWidget(self.auto_groups_check)
+            auto_group_layout.addWidget(QLabel("Importance Cutoff:"))
+            auto_group_layout.addWidget(self.importance_cutoff_edit)
+            auto_group_layout.addWidget(self.ignore_ambiguous_check)
+
+            link_layout = QVBoxLayout()
+            link_layout.addWidget(QLabel("Link Mode:"))
+            link_layout.addWidget(self.vba_links_check)
             
             encoding_layout = QVBoxLayout()
             encoding_layout.addWidget(QLabel("Encoding:"))
@@ -786,6 +1249,9 @@ def run_gui() -> None:
             options_layout.addLayout(lemma_col_layout)
             options_layout.addLayout(group_cols_layout)
             options_layout.addLayout(second_layout)
+            options_layout.addLayout(overlap_layout)
+            options_layout.addLayout(auto_group_layout)
+            options_layout.addLayout(link_layout)
             options_layout.addLayout(encoding_layout)
             
             settings_layout.addLayout(options_layout)
@@ -812,9 +1278,10 @@ def run_gui() -> None:
                 self.input_edit.setText(path)
 
         def pick_output(self):
-            path, _ = QFileDialog.getSaveFileName(self, "Select output", "", "CSV/XLSX Files (*.csv *.xlsx)")
+            path, _ = QFileDialog.getSaveFileName(self, "Select output", "", "Delimited/Excel Files (*.csv *.tsv *.xlsx *.xlsm)")
             if path:
                 self.output_edit.setText(path)
+                self.output_mode_combo.setCurrentText(output_mode_from_suffix(Path(path).suffix))
 
         def pick_metadata(self):
             path, _ = QFileDialog.getOpenFileName(self, "Select metadata JSON", "", "JSON Files (*.json)")
@@ -836,6 +1303,7 @@ def run_gui() -> None:
                     output_file = meta.get("output_file")
                     if output_file:
                         self.output_edit.setText(output_file)
+                        self.output_mode_combo.setCurrentText(output_mode_from_suffix(Path(str(output_file)).suffix))
                     settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
                     lemma_col = settings.get("lemma_col")
                     if lemma_col:
@@ -846,6 +1314,15 @@ def run_gui() -> None:
                     second = settings.get("second_threshold")
                     if isinstance(second, (int, float)) and 0.0 <= second <= 1.0:
                         self.second_spin.setValue(int(round(second * 100)))
+                    self.auto_groups_check.setChecked(bool(settings.get("auto_groups", False)))
+                    importance_cutoff = settings.get("importance_cutoff")
+                    if isinstance(importance_cutoff, (int, float)):
+                        self.importance_cutoff_edit.setText(str(importance_cutoff))
+                    self.ignore_ambiguous_check.setChecked(bool(settings.get("ignore_ambiguous_auto_groups", True)))
+                    overlap_measure = settings.get("overlap_measure")
+                    if overlap_measure in OVERLAP_MEASURES:
+                        self.overlap_combo.setCurrentText(str(overlap_measure))
+                    self.vba_links_check.setChecked(bool(settings.get("vba_links", False)))
                     encoding = settings.get("encoding")
                     if encoding:
                         self.encoding_edit.setText(str(encoding))
@@ -889,13 +1366,30 @@ def run_gui() -> None:
             if not self.output_edit.text().strip():
                 QMessageBox.warning(self, "Output missing", "Select an output filename")
                 return
-            if output_path.suffix.lower() not in {".csv", ".xlsx"}:
-                QMessageBox.warning(self, "Bad output", "Output must end with .csv or .xlsx")
-                return
+            output_mode = self.output_mode_combo.currentText()
+            if output_mode == ".csv":
+                output_path = output_path.with_suffix(".csv")
+            elif output_mode == ".tsv":
+                output_path = output_path.with_suffix(".tsv")
+            else:
+                output_path = output_path.with_suffix(".xlsm" if self.vba_links_check.isChecked() else ".xlsx")
+            self.output_edit.setText(str(output_path))
 
             lemma_col = self.lemma_edit.text().strip() or "lemma"
             group_cols = [c.strip() for c in self.group_edit.text().split(",") if c.strip()] or None
             second_threshold = self.second_spin.value() / 100.0
+            overlap_measure = self.overlap_combo.currentText()
+            auto_groups = self.auto_groups_check.isChecked()
+            try:
+                importance_cutoff = float(self.importance_cutoff_edit.text().strip() or "0")
+            except ValueError:
+                QMessageBox.warning(self, "Bad cutoff", "Importance cutoff must be a number")
+                return
+            if importance_cutoff < 0.0:
+                QMessageBox.warning(self, "Bad cutoff", "Importance cutoff must be non-negative")
+                return
+            ignore_ambiguous_auto_groups = self.ignore_ambiguous_check.isChecked()
+            use_vba_links = self.vba_links_check.isChecked()
             encoding = self.encoding_edit.text().strip() or "utf-8"
 
             self.progress_text.clear()
@@ -910,6 +1404,11 @@ def run_gui() -> None:
                 lemma_col=lemma_col,
                 group_cols=group_cols,
                 second_threshold=second_threshold,
+                overlap_measure=overlap_measure,
+                auto_groups=auto_groups,
+                importance_cutoff=importance_cutoff,
+                ignore_ambiguous_auto_groups=ignore_ambiguous_auto_groups,
+                use_vba_links=use_vba_links,
                 encoding=encoding,
                 metadata_path=self.meta_path,
             )
@@ -920,6 +1419,18 @@ def run_gui() -> None:
 
         def append_log(self, msg: str):
             self.progress_text.append(msg)
+
+        def update_auto_group_controls(self, checked: bool):
+            excel_enabled = self.output_mode_combo.currentText() == "excel"
+            self.importance_cutoff_edit.setEnabled(checked and excel_enabled)
+            self.ignore_ambiguous_check.setEnabled(checked and excel_enabled)
+
+        def update_output_controls(self, _mode: str):
+            excel_enabled = self.output_mode_combo.currentText() == "excel"
+            self.overlap_combo.setEnabled(excel_enabled)
+            self.vba_links_check.setEnabled(excel_enabled)
+            self.auto_groups_check.setEnabled(excel_enabled)
+            self.update_auto_group_controls(self.auto_groups_check.isChecked())
 
         def update_progress(self, current: int, total: int):
             if total and total > 0:
