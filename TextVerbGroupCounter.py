@@ -203,6 +203,38 @@ def load_metadata(json_path: Path) -> Dict[str, Any]:
         return data
 
 
+def load_counter_metadata(json_path: Path) -> Dict[str, Any]:
+    """Load and validate TextVerbGroupCounter metadata."""
+    data = load_metadata(json_path)
+    tool = data.get("tool")
+    if tool != "TextVerbGroupCounter":
+        raise ValueError(f"Unknown tool in metadata: {tool}")
+    return data
+
+
+def apply_metadata_settings(
+    args: argparse.Namespace,
+    metadata: Dict[str, Any],
+    argv_list: Optional[Sequence[str]] = None,
+) -> None:
+    """Apply metadata settings unless explicitly overridden on the CLI."""
+    settings = metadata.get("settings", {}) if isinstance(metadata.get("settings"), dict) else {}
+    provided_args = set(argv_list or [])
+
+    if "--text-col" not in provided_args:
+        args.text_col = settings.get("text_col", args.text_col)
+    if "--encoding" not in provided_args:
+        args.encoding = settings.get("encoding", args.encoding)
+    if "--model" not in provided_args:
+        args.model = settings.get("model", args.model)
+    if "--include-aux" not in provided_args:
+        args.include_aux = settings.get("include_aux", args.include_aux)
+    if "--batch-size" not in provided_args:
+        args.batch_size = settings.get("batch_size", args.batch_size)
+    if "--where" not in provided_args:
+        args.where = settings.get("where", args.where)
+
+
 # ------------------------- spaCy helpers -------------------------
 
 def load_spacy_model(model_name: str, logger: Optional[logging.Logger] = None):
@@ -832,23 +864,8 @@ def run_cli(argv: Optional[List[str]] = None, on_progress=None, on_progress_valu
         logger.info("CPU-only mode enabled (--force-cpu)")
 
     if args.load_metadata:
-        meta = load_metadata(Path(args.load_metadata))
-        settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
-        # Only apply metadata settings if the corresponding CLI argument was NOT explicitly provided
-        argv_list = argv if argv else []
-        
-        if "--text-col" not in argv_list:
-            args.text_col = settings.get("text_col", args.text_col)
-        if "--encoding" not in argv_list:
-            args.encoding = settings.get("encoding", args.encoding)
-        if "--model" not in argv_list:
-            args.model = settings.get("model", args.model)
-        if "--include-aux" not in argv_list:
-            args.include_aux = settings.get("include_aux", args.include_aux)
-        if "--batch-size" not in argv_list:
-            args.batch_size = settings.get("batch_size", args.batch_size)
-        if "--where" not in argv_list:
-            args.where = settings.get("where", args.where)
+        meta = load_counter_metadata(Path(args.load_metadata))
+        apply_metadata_settings(args, meta, argv)
 
     input_path = Path(args.input_csv)
     group_path = Path(args.group_csv)
@@ -1186,11 +1203,7 @@ def run_gui() -> None:
                 return
             self.meta_path = Path(path)
             try:
-                meta = load_metadata(Path(path))
-                tool = meta.get("tool")
-                if tool != "TextVerbGroupCounter":
-                    QMessageBox.warning(self, "Metadata error", f"Unknown tool in metadata: {tool}")
-                    return
+                meta = load_counter_metadata(Path(path))
                 input_file = meta.get("input_file")
                 if input_file:
                     self.input_edit.setText(str(input_file))
@@ -1200,24 +1213,21 @@ def run_gui() -> None:
                 output_file = meta.get("output_file")
                 if output_file:
                     self.output_edit.setText(str(output_file))
-                settings = meta.get("settings", {}) if isinstance(meta.get("settings"), dict) else {}
-                text_col = settings.get("text_col")
-                if text_col:
-                    self.text_col_edit.setText(str(text_col))
-                encoding = settings.get("encoding")
-                if encoding:
-                    self.encoding_edit.setText(str(encoding))
-                model = settings.get("model")
-                if model:
-                    self.model_edit.setText(str(model))
-                include_aux = settings.get("include_aux")
-                self.include_aux_check.setChecked(bool(include_aux))
-                batch_size = settings.get("batch_size")
-                if isinstance(batch_size, int) and batch_size > 0:
-                    self.batch_spin.setValue(batch_size)
-                where = settings.get("where")
-                if where:
-                    self.where_edit.setText(str(where))
+                meta_args = argparse.Namespace(
+                    text_col=self.text_col_edit.text().strip() or "text",
+                    encoding=self.encoding_edit.text().strip() or "utf-8",
+                    model=self.model_edit.text().strip() or "en_core_web_sm",
+                    include_aux=self.include_aux_check.isChecked(),
+                    batch_size=self.batch_spin.value(),
+                    where=self.where_edit.text().strip() or None,
+                )
+                apply_metadata_settings(meta_args, meta)
+                self.text_col_edit.setText(str(meta_args.text_col))
+                self.encoding_edit.setText(str(meta_args.encoding))
+                self.model_edit.setText(str(meta_args.model))
+                self.include_aux_check.setChecked(bool(meta_args.include_aux))
+                self.batch_spin.setValue(int(meta_args.batch_size))
+                self.where_edit.setText("" if meta_args.where is None else str(meta_args.where))
                 QMessageBox.information(self, "Metadata loaded", "✓ Loaded TextVerbGroupCounter metadata")
             except Exception as e:
                 QMessageBox.warning(self, "Metadata error", f"Could not read metadata JSON: {str(e)}")
