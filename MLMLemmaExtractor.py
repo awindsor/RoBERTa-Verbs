@@ -50,6 +50,17 @@ def infer_top_k(fieldnames: List[str]) -> int:
     return k
 
 
+def resolve_sentence_column(fieldnames: List[str], requested: str) -> str:
+    """Resolve sentence/context column names while preserving explicit overrides."""
+    if requested in fieldnames:
+        return requested
+    if requested == "sentence" and "context" in fieldnames:
+        return "context"
+    if requested == "context" and "sentence" in fieldnames:
+        return "sentence"
+    raise ValueError(f"Missing required column: {requested}")
+
+
 def extract_lemma_sentences(
     mlm_csv_path: Path,
     lemmas: List[str],
@@ -78,8 +89,9 @@ def extract_lemma_sentences(
         if reader.fieldnames is None:
             raise ValueError("CSV has no header.")
         
-        if lemma_col not in reader.fieldnames or sentence_col not in reader.fieldnames:
-            raise ValueError(f"Missing required columns: {lemma_col} or {sentence_col}")
+        if lemma_col not in reader.fieldnames:
+            raise ValueError(f"Missing required column: {lemma_col}")
+        sentence_col = resolve_sentence_column(list(reader.fieldnames), sentence_col)
         
         # Infer actual top-k from CSV header
         actual_k = infer_top_k(list(reader.fieldnames))
