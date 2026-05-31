@@ -170,6 +170,12 @@ def load_mlm_metadata(json_path: Path) -> Any:
         return json.load(f)
 
 
+def default_mlm_output_path(input_path: Path) -> Path:
+    """Return the default MLM output path beside the input file."""
+    suffix = input_path.suffix or ".csv"
+    return input_path.with_name(f"{input_path.stem} mlm{suffix}")
+
+
 def get_expected_input_checksum(metadata: Dict) -> Tuple[Optional[str], str]:
     """Return the checksum the current MLM input should match.
 
@@ -1191,7 +1197,7 @@ def run_gui() -> None:
                     self.input_text.setText(input_csv)
                     if input_csv:
                         in_path = Path(input_csv)
-                        default_out = in_path.with_name(f"{in_path.stem}.mlm.csv")
+                        default_out = default_mlm_output_path(in_path)
                         self.output_text.setText(str(default_out))
                 else:
                     QMessageBox.warning(
