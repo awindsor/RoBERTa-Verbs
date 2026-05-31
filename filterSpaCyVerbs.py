@@ -178,8 +178,13 @@ def _safe_eval_bool(node: ast.AST) -> Any:
             for k, v in zip(node.keys or [], node.values or [])
             if k is not None
         }
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return not _safe_eval_bool(node.operand)
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.Not):
+            return not _safe_eval_bool(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -_safe_eval_bool(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return +_safe_eval_bool(node.operand)
     if isinstance(node, ast.BoolOp):
         if isinstance(node.op, ast.And):
             return all(_safe_eval_bool(v) for v in node.values)
@@ -211,6 +216,17 @@ def _safe_eval_bool(node: ast.AST) -> Any:
                 return False
             left = right
         return True
+    if isinstance(node, ast.Subscript):
+        value = _safe_eval_bool(node.value)
+        if isinstance(node.slice, ast.Slice):
+            slice_value = slice(
+                _safe_eval_bool(node.slice.lower) if node.slice.lower is not None else None,
+                _safe_eval_bool(node.slice.upper) if node.slice.upper is not None else None,
+                _safe_eval_bool(node.slice.step) if node.slice.step is not None else None,
+            )
+        else:
+            slice_value = _safe_eval_bool(node.slice)
+        return value[slice_value]
     raise ValueError(f"Unsupported expression element: {type(node).__name__}")
 
 
