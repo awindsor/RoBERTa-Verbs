@@ -981,6 +981,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Logging verbosity.",
     )
     ap.add_argument("--load-metadata", help="Load settings and input/output paths from a SpaCyVerbExtractor2 JSON file.")
+    ap.add_argument(
+        "--allow-checksum-mismatch",
+        action="store_true",
+        help="When loading metadata, continue even if input checksums differ from the JSON.",
+    )
     return ap
 
 
@@ -989,6 +994,8 @@ def reconstruct_command(args: argparse.Namespace, paths: Sequence[Path]) -> str:
     cmd.extend(str(path) for path in paths)
     if getattr(args, "load_metadata", None):
         cmd.extend(["--load-metadata", args.load_metadata])
+    if getattr(args, "allow_checksum_mismatch", False):
+        cmd.append("--allow-checksum-mismatch")
     if args.paths_file:
         cmd.extend(["--paths-file", args.paths_file])
     if args.output != "verbs2.csv":
@@ -1050,9 +1057,52 @@ def metadata_cli_paths(metadata: Dict[str, Any]) -> List[str]:
     return [str(path) for path in input_paths]
 
 
-def load_cli_metadata_defaults(args: argparse.Namespace, provided_args: set[str]) -> List[str]:
+def verify_metadata_input_checksums(paths: Sequence[Path], metadata: Dict[str, Any]) -> Dict[str, List[str]]:
+    input_checksums = metadata.get("input_checksums", {})
+    checksum_lookup = dict(input_checksums)
+    for saved_path, checksum in input_checksums.items():
+        try:
+            checksum_lookup[str(Path(saved_path).resolve())] = checksum
+        except OSError:
+            pass
+    issues: Dict[str, List[str]] = {
+        "missing_files": [],
+        "checksum_mismatches": [],
+        "unverified_files": [],
+    }
+
+    for path in paths:
+        path_str = str(path)
+        expected_checksum = checksum_lookup.get(path_str)
+        if expected_checksum is None:
+            expected_checksum = checksum_lookup.get(str(path.resolve()))
+        if expected_checksum is None:
+            issues["unverified_files"].append(path_str)
+            continue
+        if not path.exists():
+            issues["missing_files"].append(path_str)
+            continue
+        actual_checksum = compute_file_md5(path)
+        if actual_checksum != expected_checksum:
+            issues["checksum_mismatches"].append(path_str)
+
+    return issues
+
+
+def format_checksum_issues(issues: Dict[str, List[str]]) -> str:
+    messages = []
+    if issues["missing_files"]:
+        messages.append("Missing input files:\n" + "\n".join(issues["missing_files"]))
+    if issues["checksum_mismatches"]:
+        messages.append("Input files changed since metadata was written:\n" + "\n".join(issues["checksum_mismatches"]))
+    if issues["unverified_files"]:
+        messages.append("Input files not listed in metadata:\n" + "\n".join(issues["unverified_files"]))
+    return "\n\n".join(messages)
+
+
+def load_cli_metadata_defaults(args: argparse.Namespace, provided_args: set[str]) -> Optional[Dict[str, Any]]:
     if not args.load_metadata:
-        return args.paths
+        return None
 
     metadata_path = Path(args.load_metadata)
     if not metadata_path.exists():
@@ -1092,7 +1142,7 @@ def load_cli_metadata_defaults(args: argparse.Namespace, provided_args: set[str]
         args.context_chars = settings.get("context_chars")
     if not args.tsv and "--tsv" not in provided_args:
         args.tsv = settings.get("output_format") == "tsv"
-    return args.paths
+    return metadata
 
 
 def apply_cli_defaults(args: argparse.Namespace) -> None:
@@ -1108,13 +1158,23 @@ def apply_cli_defaults(args: argparse.Namespace) -> None:
 def run_cli() -> None:
     parser = build_cli_parser()
     args = parser.parse_args()
-    load_cli_metadata_defaults(args, set(sys.argv[1:]))
+    metadata = load_cli_metadata_defaults(args, set(sys.argv[1:]))
     apply_cli_defaults(args)
     validate_context_args(args)
 
     selected_paths = iter_paths(args.paths, args.paths_file)
     normalized_paths = normalize_input_selection(selected_paths, args.filter_expr)
     validate_input_mode(selected_paths[0], normalized_paths)
+    if metadata:
+        checksum_issues = verify_metadata_input_checksums(normalized_paths, metadata)
+        has_checksum_issues = any(checksum_issues.values())
+        if has_checksum_issues and not args.allow_checksum_mismatch:
+            raise SystemExit(
+                format_checksum_issues(checksum_issues)
+                + "\n\nUse --allow-checksum-mismatch to run anyway."
+            )
+        if has_checksum_issues:
+            print("Warning: " + format_checksum_issues(checksum_issues))
 
     validate_csv_config(normalized_paths, args)
     output_path = Path(args.output).resolve()
