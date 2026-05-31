@@ -942,8 +942,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     ap.add_argument("--paths-file", help="Text file containing one input path.")
     ap.add_argument("-o", "--output", default="verbs2.csv", help="Output CSV/TSV file.")
     ap.add_argument("--tsv", action="store_true", help="Write TSV instead of CSV.")
-    ap.add_argument("--model", default="en_core_web_sm", help="spaCy model name.")
-    ap.add_argument("--encoding", default="utf-8", help="Input file encoding.")
+    ap.add_argument("--model", default=None, help="spaCy model name.")
+    ap.add_argument("--encoding", default=None, help="Input file encoding.")
     ap.add_argument(
         "--filter-expr",
         default=None,
@@ -957,7 +957,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     ap.add_argument("--csv-text-column", default=None, help="CSV column containing the source text.")
     ap.add_argument(
         "--csv-row-label-mode",
-        default=ROW_LABEL_MODE_ROW_NUMBER,
+        default=None,
         choices=[ROW_LABEL_MODE_ROW_NUMBER, ROW_LABEL_MODE_ID_COLUMN, ROW_LABEL_MODE_ALL_COLUMNS],
         help="How to label CSV-derived output rows.",
     )
@@ -971,21 +971,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "or the full source text/CSV field."
         ),
     )
-    ap.add_argument("--context-sentences", type=int, default=1, help="Odd number of sentences in the context window.")
-    ap.add_argument("--context-chars", type=int, default=301, help="Character width of the context window.")
-    ap.add_argument("--log-every", type=int, default=10000, help="Log progress every N processed sources.")
+    ap.add_argument("--context-sentences", type=int, default=None, help="Odd number of sentences in the context window.")
+    ap.add_argument("--context-chars", type=int, default=None, help="Character width of the context window.")
+    ap.add_argument("--log-every", type=int, default=None, help="Log progress every N processed sources.")
     ap.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    ap.add_argument("--load-metadata", help="Load settings and input/output paths from a SpaCyVerbExtractor2 JSON file.")
     return ap
 
 
 def reconstruct_command(args: argparse.Namespace, paths: Sequence[Path]) -> str:
     cmd = ["python", "SpaCyVerbExtractor2.py"]
     cmd.extend(str(path) for path in paths)
+    if getattr(args, "load_metadata", None):
+        cmd.extend(["--load-metadata", args.load_metadata])
     if args.paths_file:
         cmd.extend(["--paths-file", args.paths_file])
     if args.output != "verbs2.csv":
@@ -1035,9 +1038,78 @@ def metadata_settings_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def metadata_cli_paths(metadata: Dict[str, Any]) -> List[str]:
+    input_paths = [Path(path) for path in metadata.get("input_files", [])]
+    if len(input_paths) <= 1:
+        return [str(path) for path in input_paths]
+
+    parents = {path.parent for path in input_paths}
+    if len(parents) == 1 and all(is_raw_text_path(path) for path in input_paths):
+        return [str(next(iter(parents)))]
+
+    return [str(path) for path in input_paths]
+
+
+def load_cli_metadata_defaults(args: argparse.Namespace, provided_args: set[str]) -> List[str]:
+    if not args.load_metadata:
+        return args.paths
+
+    metadata_path = Path(args.load_metadata)
+    if not metadata_path.exists():
+        raise SystemExit(f"Metadata file not found: {metadata_path}")
+
+    metadata = load_run_metadata(metadata_path)
+    tool_name = metadata.get("tool", "unknown")
+    if tool_name != "SpaCyVerbExtractor2":
+        raise SystemExit(
+            f"Unsupported metadata source: {tool_name!r}. Expected 'SpaCyVerbExtractor2'."
+        )
+
+    settings = metadata.get("settings", {})
+    if not args.paths and not args.paths_file:
+        args.paths = metadata_cli_paths(metadata)
+    if args.output == "verbs2.csv" and "-o" not in provided_args and "--output" not in provided_args:
+        args.output = metadata.get("output_file") or args.output
+    if args.model is None and "--model" not in provided_args:
+        args.model = settings.get("model")
+    if args.encoding is None and "--encoding" not in provided_args:
+        args.encoding = settings.get("encoding")
+    if args.filter_expr is None and "--filter-expr" not in provided_args:
+        args.filter_expr = settings.get("filter_expr")
+    if not args.include_aux and "--include-aux" not in provided_args:
+        args.include_aux = bool(settings.get("include_aux", False))
+    if args.csv_text_column is None and "--csv-text-column" not in provided_args:
+        args.csv_text_column = settings.get("csv_text_column")
+    if args.csv_row_label_mode is None and "--csv-row-label-mode" not in provided_args:
+        args.csv_row_label_mode = settings.get("csv_row_label_mode")
+    if args.csv_id_column is None and "--csv-id-column" not in provided_args:
+        args.csv_id_column = settings.get("csv_id_column")
+    if args.context_mode == CONTEXT_MODE_SENTENCES and "--context-mode" not in provided_args:
+        args.context_mode = settings.get("context_mode", args.context_mode)
+    if args.context_sentences is None and "--context-sentences" not in provided_args:
+        args.context_sentences = settings.get("context_sentences")
+    if args.context_chars is None and "--context-chars" not in provided_args:
+        args.context_chars = settings.get("context_chars")
+    if not args.tsv and "--tsv" not in provided_args:
+        args.tsv = settings.get("output_format") == "tsv"
+    return args.paths
+
+
+def apply_cli_defaults(args: argparse.Namespace) -> None:
+    args.model = args.model or "en_core_web_sm"
+    args.encoding = args.encoding or "utf-8"
+    args.csv_row_label_mode = args.csv_row_label_mode or ROW_LABEL_MODE_ROW_NUMBER
+    args.context_sentences = int(args.context_sentences or 1)
+    args.context_chars = int(args.context_chars or 301)
+    args.log_every = int(args.log_every or 10000)
+    args.log_level = args.log_level or "INFO"
+
+
 def run_cli() -> None:
     parser = build_cli_parser()
     args = parser.parse_args()
+    load_cli_metadata_defaults(args, set(sys.argv[1:]))
+    apply_cli_defaults(args)
     validate_context_args(args)
 
     selected_paths = iter_paths(args.paths, args.paths_file)
