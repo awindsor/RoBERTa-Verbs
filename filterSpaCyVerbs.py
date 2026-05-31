@@ -40,11 +40,10 @@ import hashlib
 import json
 import re
 import sys
-import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, Optional, Tuple
 
 MODE_ABSOLUTE = "absolute"
 MODE_PERCENT = "percent"
@@ -563,11 +562,9 @@ def run_cli() -> None:
 def run_gui() -> None:
     """Launch the GUI application."""
     try:
-        from PySide6.QtCore import QThread, Signal, QSize
-        from PySide6.QtWidgets import (
+        from PySide6.QtCore import QThread, Signal, QSize  # type: ignore[import-not-found]
+        from PySide6.QtWidgets import (  # type: ignore[import-not-found]
             QApplication,
-            QButtonGroup,
-            QCheckBox,
             QMainWindow,
             QWidget,
             QVBoxLayout,
