@@ -61,6 +61,18 @@ def get_version_info() -> Dict:
     }
 
 
+def check_version_compatibility(metadata: Dict) -> Optional[str]:
+    """Return a warning if metadata was created with a different Python version."""
+    metadata_python = metadata.get("versions", {}).get("python")
+    if not metadata_python:
+        return None
+
+    current_python = get_version_info()["python"]
+    if metadata_python != current_python:
+        return f"⚠ Python version mismatch: metadata has {metadata_python}, current is {current_python}"
+    return None
+
+
 # ============================================================================
 # CORE FILTERING LOGIC (shared by CLI and GUI)
 # ============================================================================
@@ -452,8 +464,10 @@ def run_cli() -> None:
     if args.min_freq is not None and args.max_freq is not None and args.min_freq > args.max_freq and args.min_mode == args.max_mode:
         raise SystemExit("Error: minimum cannot be greater than maximum")
     
-    input_path = Path(args.input_csv)
-    output_path = Path(args.output_csv)
+    input_csv = str(args.input_csv)
+    output_csv = str(args.output_csv)
+    input_path = Path(input_csv)
+    output_path = Path(output_csv)
     
     if not input_path.exists():
         raise SystemExit(f"Input file not found: {input_path}")
@@ -471,9 +485,10 @@ def run_cli() -> None:
         # If metadata is from SpaCyVerbExtractor and our input is its output,
         # verify against the extractor's output checksum (fallback schema)
         tool_name = metadata.get("tool", "unknown")
-        if tool_name == "SpaCyVerbExtractor" and metadata.get("output_file"):
+        metadata_output_file = metadata.get("output_file")
+        if tool_name == "SpaCyVerbExtractor" and metadata_output_file:
             try:
-                spaCy_output = Path(metadata.get("output_file"))
+                spaCy_output = Path(str(metadata_output_file))
                 # Only check if the current input matches the referenced output file
                 if input_path.resolve() == spaCy_output.resolve():
                     expected_out_checksum = metadata.get("output_checksum")
