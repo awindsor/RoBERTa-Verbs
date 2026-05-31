@@ -38,10 +38,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import urljoin
 
 import spacy
+torch: Any = None
 try:
-    import torch
+    import torch as _torch
+    torch = _torch
 except ImportError:  # pragma: no cover - optional dependency for MPS detection
-    torch = None
+    pass
 
 
 SPACY_FACTORY_DEPENDENCIES = {
@@ -123,7 +125,10 @@ def save_run_metadata(
 
 def load_run_metadata(json_path: Path) -> Dict[str, Any]:
     with json_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        metadata = json.load(f)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Metadata JSON must contain an object: {json_path}")
+    return metadata
 
 
 def setup_logging(level_name: str, log_file: Path, logger_name: str = "extract_verbs2") -> logging.Logger:
