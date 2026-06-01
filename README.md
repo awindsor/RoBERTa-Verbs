@@ -25,7 +25,7 @@ Optional transformer spaCy model support is defined in `pyproject.toml` under th
 
 ```text
 Raw text or CSV text column
-  -> SpaCyVerbExtractor.py
+  -> SpaCyVerbExtractor2.py
   -> FilterSpaCyVerbs.py or randomSampleCSV.py
   -> RoBERTaMaskedLanguageModelVerbs.py
   -> MLMGroupAggregator.py
@@ -35,7 +35,7 @@ Raw text or CSV text column
 Typical CLI run:
 
 ```bash
-python SpaCyVerbExtractor.py --paths-file filepaths.txt --output verbs.csv
+python SpaCyVerbExtractor2.py input.csv --csv-text-column text --output verbs.csv
 python FilterSpaCyVerbs.py verbs.csv verbs_min20.csv --field lemma --min-freq 20
 python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --model roberta-base --batch-size 8 --top-k 10 --device mps
 python MLMGroupAggregator.py verbs_mlm.csv groups.csv verbs_mlm_groups.csv
@@ -46,36 +46,52 @@ Metadata JSON files are written beside outputs where supported. The metadata rec
 
 ## Scripts
 
-### `SpaCyVerbExtractor.py`
+### `SpaCyVerbExtractor2.py`
 
-Extracts verbs from text files, path lists, or a CSV text column.
+Extracts verbs from one raw text file, one directory of raw text files, or one CSV text column. This is the preferred extractor for the current RoBERTa pipeline because it writes `context` and `span_in_context`.
 
 GUI:
 
 ```bash
-python SpaCyVerbExtractor.py
+python SpaCyVerbExtractor2.py
 ```
 
 CLI:
 
 ```bash
-python SpaCyVerbExtractor.py input.txt --output verbs.csv
-python SpaCyVerbExtractor.py file1.txt file2.txt --output verbs.csv --include-aux
-python SpaCyVerbExtractor.py --paths-file filepaths.txt --output verbs.tsv --tsv
-python SpaCyVerbExtractor.py input.csv --csv-text-column text --include-csv-fields --output verbs.csv
-python SpaCyVerbExtractor.py --load-metadata verbs.json input.txt --output verbs_rerun.csv
+python SpaCyVerbExtractor2.py input.txt --output verbs.csv
+python SpaCyVerbExtractor2.py texts_folder --output verbs.csv --filter-expr "{{file name}}[:4] == 'week'"
+python SpaCyVerbExtractor2.py input.csv --csv-text-column text --csv-row-label-mode row_number --output verbs.csv
+python SpaCyVerbExtractor2.py input.csv --csv-text-column text --csv-row-label-mode id_column --csv-id-column row_id --output verbs.csv
+python SpaCyVerbExtractor2.py input.csv --csv-text-column text --csv-row-label-mode all_columns --context-mode chars --context-chars 301
+python SpaCyVerbExtractor2.py --load-metadata verbs.json
 ```
 
 Current options:
 
-- Inputs: positional `paths`, `--paths-file`
+- Inputs: one positional source, `--paths-file`
 - Output: `--output`, `--tsv`
-- CSV input: `--csv-text-column`, `--include-csv-fields`
-- NLP settings: `--model`, `--encoding`, `--include-aux`, `--chunk-size`, `--overlap`
-- Runtime/logging: `--dedupe-window`, `--heartbeat-chunks`, `--log-level`
-- Reproducibility: `--load-metadata`
+- CSV input: `--csv-text-column`, `--csv-row-label-mode`, `--csv-id-column`
+- Filtering: `--filter-expr`
+- Context: `--context-mode sentences|chars|all`, `--context-sentences`, `--context-chars`
+- NLP/runtime: `--model`, `--encoding`, `--include-aux`, `--log-every`, `--log-level`
+- Reproducibility: `--load-metadata`, `--allow-checksum-mismatch`
+
+Filter expressions use `{{column}}` or file placeholders. CSV placeholders are column names. Directory/file placeholders are `{{full path}}`, `{{directory name}}`, `{{file name}}`, and `{{suffix}}`. Supported operations include `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in`, `and`, `or`, `not`, parentheses, list/set/tuple/dict literals, and string indexing/slicing.
 
 Important output columns include `lemma`, `surface_lower`, `context`, `span_in_context`, and source-document location fields. Older downstream code may also accept `sentence` and `span_in_sentence_char`.
+
+`SpaCyVerbExtractor2.py` writes preliminary JSON metadata before model loading. When loading metadata from the CLI, input checksums must match by default; pass `--allow-checksum-mismatch` only when intentionally rerunning against changed input files.
+
+### `SpaCyVerbExtractor.py`
+
+Legacy/chunked extractor for very large raw text files. It supports chunk size, overlap, overlap de-duplication, and batch processing with `nlp.pipe()`. Use it when large-file streaming is more important than Extractor2's CSV row labeling and configurable context windows.
+
+```bash
+python SpaCyVerbExtractor.py input.txt --output verbs.csv
+python SpaCyVerbExtractor.py --paths-file filepaths.txt --output verbs.tsv --tsv
+python SpaCyVerbExtractor.py input.csv --csv-text-column text --include-csv-fields --output verbs.csv
+```
 
 ### `SpaCyVerbCounter.py`
 
@@ -94,6 +110,7 @@ Filters a verb CSV by frequency, with optional row-level filtering.
 python FilterSpaCyVerbs.py verbs.csv verbs_min20.csv --field lemma --min-freq 20
 python FilterSpaCyVerbs.py verbs.csv verbs_mid.csv --field surface_lower --min-freq 10 --max-freq 5000
 python FilterSpaCyVerbs.py verbs.csv verbs_top.csv --field lemma --min-freq 80%
+python FilterSpaCyVerbs.py verbs.csv verbs_week.csv --field lemma --min-freq 5 --where "{{source_file}}[:4] == 'week'"
 python FilterSpaCyVerbs.py --load-metadata verbs_min20.json verbs_min20.csv rerun.csv --strict-checksum
 ```
 
@@ -105,6 +122,8 @@ Current options:
 - Percentile mode: append `%`, for example `--min-freq 80%`
 - Row filter: `--where "{{source}} == 'NCTE'"`
 - Reproducibility: `--load-metadata`, `--strict-checksum`
+
+Row filters support `{{column}}` placeholders with safe Python-style boolean expressions: comparisons, membership tests, `and`/`or`/`not`, collection literals, and string indexing/slicing such as `{{lemma}}[:3] == 'run'`.
 
 ### `randomSampleCSV.py`
 
@@ -129,6 +148,7 @@ CLI:
 ```bash
 python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --model roberta-base --batch-size 8 --top-k 10
 python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm.csv --device mps --log-every 5000
+python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv verbs_mlm_with_context.csv --include-context
 python RoBERTaMaskedLanguageModelVerbs.py --load-metadata verbs_min20.json verbs_min20.csv verbs_mlm.csv
 python RoBERTaMaskedLanguageModelVerbs.py verbs_min20.csv debug_mlm.csv --debug-limit 100 --log-level DEBUG
 ```
@@ -138,9 +158,9 @@ Current options:
 - Required in CLI mode: `input_csv`, `output_csv`
 - Model/runtime: `--model`, `--batch-size`, `--top-k`, `--device`
 - Logging/debugging: `--log-every`, `--log-level`, `--debug-limit`
-- CSV/reproducibility: `--encoding`, `--load-metadata`
+- CSV/reproducibility: `--encoding`, `--include-context`, `--load-metadata`
 
-Input CSVs must contain either `context` + `span_in_context` or `sentence` + `span_in_sentence_char`. Output appends `token_1`, `prob_1`, ..., `token_k`, `prob_k`.
+Input CSVs must contain either `context` + `span_in_context` or `sentence` + `span_in_sentence_char`. By default, output omits the text column used for masking (`context` or `sentence`) and appends `token_1`, `prob_1`, ..., `token_k`, `prob_k`. Use `--include-context` or the GUI checkbox to retain the context/text column in the MLM output.
 
 Memory note: if macOS reports application memory pressure, lower `--batch-size`. The script retries smaller batches on memory failures and clears CUDA/MPS caches between batches, but RoBERTa still produces large logits internally.
 
@@ -275,7 +295,7 @@ Current options:
 - `count_patterns.py`: local pattern-counting utility for targeted analysis.
 - `view_log.py`: log viewer utility.
 
-Experimental or legacy files are present in the repository, including `SpaCyVerbExtractor2.py`, `MLMGroupProbabilityAggregator.py`, and several one-off scripts with descriptive filenames. Prefer the scripts listed above for current pipeline work.
+Experimental or legacy files are present in the repository, including `MLMGroupProbabilityAggregator.py` and several one-off scripts with descriptive filenames. Prefer the scripts listed above for current pipeline work.
 
 ## Metadata And Checksums
 
@@ -290,12 +310,14 @@ Checksum behavior:
 
 Use `--load-metadata` to reload settings from a previous run. CLI arguments supplied at the same time override loaded settings where supported.
 
+For `SpaCyVerbExtractor2.py`, CLI metadata loading aborts on missing, changed, or unlisted input files unless `--allow-checksum-mismatch` is supplied.
+
 ## Testing
 
 Run syntax checks for edited scripts:
 
 ```bash
-python3 -m py_compile SpaCyVerbExtractor.py FilterSpaCyVerbs.py RoBERTaMaskedLanguageModelVerbs.py MLMGroupAggregator.py LemmaToGroupProbs.py
+python3 -m py_compile SpaCyVerbExtractor2.py FilterSpaCyVerbs.py RoBERTaMaskedLanguageModelVerbs.py MLMGroupAggregator.py LemmaToGroupProbs.py
 ```
 
 Run the test suite:
