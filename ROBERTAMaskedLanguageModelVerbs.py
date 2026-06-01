@@ -105,6 +105,8 @@ def reconstruct_mlm_command(input_csv: str, output_csv: str, args) -> str:
         cmd.extend(["--device", args.device])
     if args.debug_limit:
         cmd.extend(["--debug-limit", str(args.debug_limit)])
+    if getattr(args, "include_context", False):
+        cmd.append("--include-context")
     
     return " ".join(cmd)
 
@@ -241,6 +243,25 @@ def resolve_context_columns(fieldnames: List[str]) -> Tuple[str, str]:
         "Input CSV must include either "
         "('sentence', 'span_in_sentence_char') or ('context', 'span_in_context')."
     )
+
+
+def mlm_output_fieldnames(
+    input_fieldnames: List[str],
+    pred_cols: List[str],
+    text_col: str,
+    include_context: bool,
+) -> List[str]:
+    base_fields = list(input_fieldnames)
+    if not include_context:
+        base_fields = [field for field in base_fields if field != text_col]
+    return base_fields + pred_cols
+
+
+def mlm_output_row(row: Dict[str, str], text_col: str, include_context: bool) -> Dict[str, str]:
+    out_row = dict(row)
+    if not include_context:
+        out_row.pop(text_col, None)
+    return out_row
 
 
 def decode_token(tokenizer, token_id: int) -> str:
@@ -431,6 +452,11 @@ def run_cli() -> None:
     ap.add_argument("--debug-limit", type=int, default=0,
                     help="If >0, stop after this many rows seen (processed+skipped). Handy for debugging (e.g., 100).")
     ap.add_argument("--encoding", default="utf-8", help="CSV encoding (default: utf-8)")
+    ap.add_argument(
+        "--include-context",
+        action="store_true",
+        help="Include the context/sentence text column in the output CSV.",
+    )
     ap.add_argument("--load-metadata", help="Load settings from metadata JSON (CLI args override)")
     args = ap.parse_args()
 
@@ -485,6 +511,8 @@ def run_cli() -> None:
             args.top_k = metadata.get("settings", {}).get("top_k", 10)
         if not args.device:
             args.device = metadata.get("settings", {}).get("device")
+        if not args.include_context:
+            args.include_context = bool(metadata.get("settings", {}).get("include_context", False))
         
         # If input not provided on CLI, use from metadata
         if not args.input_csv:
@@ -577,7 +605,12 @@ def run_cli() -> None:
             except ValueError as exc:
                 raise SystemExit(str(exc))
 
-            out_fieldnames = list(reader.fieldnames) + pred_cols
+            out_fieldnames = mlm_output_fieldnames(
+                list(reader.fieldnames),
+                pred_cols,
+                text_col,
+                args.include_context,
+            )
             writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
             writer.writeheader()
 
@@ -599,7 +632,7 @@ def run_cli() -> None:
                 )
 
                 for pr, pr_preds in zip(batch, preds):
-                    out_row = dict(pr.row)
+                    out_row = mlm_output_row(pr.row, text_col, args.include_context)
 
                     # write top-k token/prob
                     for j, (tok, prob) in enumerate(pr_preds, start=1):
@@ -662,6 +695,7 @@ def run_cli() -> None:
             "device": str(dev),
             "encoding": args.encoding,
             "debug_limit": args.debug_limit if args.debug_limit else None,
+            "include_context": args.include_context,
         }
         
         stats = {
@@ -693,6 +727,7 @@ def run_cli() -> None:
             "device": str(dev),
             "encoding": args.encoding,
             "debug_limit": args.debug_limit if args.debug_limit else None,
+            "include_context": args.include_context,
         }
         
         stats = {
@@ -758,6 +793,7 @@ def run_gui() -> None:
             top_k: int,
             device_name: str,
             debug_limit: int,
+            include_context: bool,
         ):
             super().__init__()
             self.input_path = input_path
@@ -767,6 +803,7 @@ def run_gui() -> None:
             self.top_k = top_k
             self.device_name = device_name
             self.debug_limit = debug_limit
+            self.include_context = include_context
             self._stop_requested = False
         
         def request_stop(self):
@@ -829,7 +866,12 @@ def run_gui() -> None:
                         raise ValueError("Input CSV has no header")
                     text_col, span_col = resolve_context_columns(list(reader.fieldnames))
                     
-                    out_fieldnames = list(reader.fieldnames) + pred_cols
+                    out_fieldnames = mlm_output_fieldnames(
+                        list(reader.fieldnames),
+                        pred_cols,
+                        text_col,
+                        self.include_context,
+                    )
                     writer = csv.DictWriter(fout, fieldnames=out_fieldnames)
                     writer.writeheader()
                     
@@ -846,7 +888,7 @@ def run_gui() -> None:
                         )
                         
                         for pr, pr_preds in zip(batch, preds):
-                            out_row = dict(pr.row)
+                            out_row = mlm_output_row(pr.row, text_col, self.include_context)
                             for j, (tok, prob) in enumerate(pr_preds, start=1):
                                 out_row[f"token_{j}"] = tok
                                 out_row[f"prob_{j}"] = f"{prob:.10g}"
@@ -901,6 +943,7 @@ def run_gui() -> None:
                     "top_k": self.top_k,
                     "device": str(dev),
                     "debug_limit": self.debug_limit if self.debug_limit else None,
+                    "include_context": self.include_context,
                 }
                 
                 stats = {
@@ -916,6 +959,8 @@ def run_gui() -> None:
                     f"--model {self.model_name} --batch-size {self.batch_size} --top-k {self.top_k} "
                     f"--device {dev}"
                 )
+                if self.include_context:
+                    gui_command += " --include-context"
                 
                 save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command)
                 
@@ -939,6 +984,7 @@ def run_gui() -> None:
                             "top_k": self.top_k,
                             "device": str(dev),
                             "debug_limit": self.debug_limit if self.debug_limit else None,
+                            "include_context": self.include_context,
                         }
                         
                         stats = {
@@ -953,6 +999,8 @@ def run_gui() -> None:
                             f"--model {self.model_name} --batch-size {self.batch_size} --top-k {self.top_k} "
                             f"--device {dev}"
                         )
+                        if self.include_context:
+                            gui_command += " --include-context"
                         
                         save_mlm_metadata(self.output_path, self.input_path, input_checksum, output_checksum, mlm_settings, stats, None, gui_command, status="stopped_by_user")
                         self.progress_update.emit(f"✓ Saved incomplete metadata: {self.output_path.with_suffix('.json')}")
@@ -1093,6 +1141,14 @@ def run_gui() -> None:
             debug_layout.addWidget(self.debug_spin)
             debug_layout.addStretch()
             settings_layout.addLayout(debug_layout)
+
+            # Output options
+            output_options_layout = QHBoxLayout()
+            self.include_context_check = QCheckBox("Include context/text column in output")
+            self.include_context_check.setChecked(False)
+            output_options_layout.addWidget(self.include_context_check)
+            output_options_layout.addStretch()
+            settings_layout.addLayout(output_options_layout)
             
             settings_group.setLayout(settings_layout)
             layout.addWidget(settings_group)
@@ -1181,6 +1237,7 @@ def run_gui() -> None:
                     self.model_combo.setCurrentText(settings.get("model", "roberta-base"))
                     self.batch_spin.setValue(settings.get("batch_size", 16))
                     self.topk_spin.setValue(settings.get("top_k", 10))
+                    self.include_context_check.setChecked(bool(settings.get("include_context", False)))
                     
                     device = settings.get("device", "auto")
                     if "cuda" in str(device).lower():
@@ -1284,6 +1341,7 @@ def run_gui() -> None:
             self.log(f"Batch size: {self.batch_spin.value()}")
             self.log(f"Top-K: {self.topk_spin.value()}")
             self.log(f"Device: {self.device_combo.currentText()}")
+            self.log(f"Include context/text: {self.include_context_check.isChecked()}")
             if self.debug_check.isChecked():
                 self.log(f"Debug limit: {self.debug_spin.value()}")
             self.log("")
@@ -1306,6 +1364,7 @@ def run_gui() -> None:
                 self.topk_spin.value(),
                 self.device_combo.currentText(),
                 self.debug_spin.value() if self.debug_check.isChecked() else 0,
+                self.include_context_check.isChecked(),
             )
             
             self.worker.progress_update.connect(self.log)
